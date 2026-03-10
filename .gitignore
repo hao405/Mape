@@ -186,3 +186,6 @@ dmypy.json
 *.pth
 **/checkpoint*/
 **/checkpoints*/
+# ignore checkpoints & text logs
+*.ckpt
+*.txt
