@@ -193,3 +193,7 @@ dmypy.json
 # Weights & Biases artifacts/logs
 wandb/
 *.wandb
+
+# Weights & Biases
+wandb/
+*.wandb
