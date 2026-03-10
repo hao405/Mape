@@ -181,3 +181,8 @@ dmypy.json
 *.pth
 **/checkpoint*/
 **/checkpoints*/
+*.ckpt
+*.pt
+*.pth
+**/checkpoint*/
+**/checkpoints*/
