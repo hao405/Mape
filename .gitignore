@@ -189,3 +189,7 @@ dmypy.json
 # ignore checkpoints & text logs
 *.ckpt
 *.txt
+
+# Weights & Biases artifacts/logs
+wandb/
+*.wandb
