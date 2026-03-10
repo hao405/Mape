@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=bxi
+#SBATCH --job-name=use_rope
 #SBATCH --partition=faculty
 #SBATCH --account=test-acc
 #SBATCH --qos=bgqos
@@ -13,7 +13,7 @@
 #SBATCH --error=/vast/users/guangyi.chen/causal_group/zijian.li/slurm_tools/logs/%x-%j.err
 #SBATCH --export=ALL
 #SBATCH --exclude=auh7-1b-gpu-[214-221,260-267,268-275,282-289],auh7-1b-gpu-259
-#SBATCH --nodelist=auh7-1b-gpu-[222-229,234-241]
+#SBATCH --nodelist=auh7-1b-gpu-[222-229,234-241,306-313]
 
 
 
@@ -89,7 +89,7 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --batch_size 256 \
             --micro_batch_size 4 \
             --lr 2e-4 \
-            --scheduler cosine_with_restarts \
+            --scheduler cosine_warmup \
             --cosine_lr_end 2e-5 \
             --warmup_proportion 0.05 \
             --gradient_clipping 1.0 \
@@ -114,7 +114,7 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --icl_nhead 4 \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl/stabe1/checkpoint/dir4  \
+            --checkpoint_dir /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl/stabe1/checkpoint/dir2  \
             --save_temp_every 50 \
             --save_perm_every 5000 \
             --only_load_model True \
