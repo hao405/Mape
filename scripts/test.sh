@@ -51,7 +51,7 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-^lo,docker0}
 export OPTIMIZER=${OPTIMIZER:-muon}
 
-export PROJECT_HOME="/vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl"
+export PROJECT_HOME="/vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl_muon"
 export PYTHONPATH="$PROJECT_HOME:$PYTHONPATH"
 
 echo "[$(date)] MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
@@ -77,11 +77,11 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
   conda activate tabicl
 
 
-  torchrun  --nproc_per_node=${GPUS_PER_NODE} --nnodes='"${NUM_NODES}"' --node_rank=${NODE_RANK} --master_addr='"${MASTER_ADDR}"' --master_port='"${MASTER_PORT}"'  /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl/src/tabicl/train/run.py \
+  torchrun  --nproc_per_node=${GPUS_PER_NODE} --nnodes='"${NUM_NODES}"' --node_rank=${NODE_RANK} --master_addr='"${MASTER_ADDR}"' --master_port='"${MASTER_PORT}"'  /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl_muon/src/tabicl/train/run.py \
             --wandb_log True \
             --wandb_project TabICL \
             --wandb_name Stage1 \
-            --wandb_dir /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl/wandb/dir \
+            --wandb_dir /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl_muon/wandb/dir \
             --wandb_mode offline \
             --device cuda \
             --dtype float32 \
@@ -117,7 +117,7 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --icl_nhead 4 \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl/stabe1/checkpoint/dir2  \
+            --checkpoint_dir /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl_muon/stabe1/checkpoint/dir2  \
             --save_temp_every 50 \
             --save_perm_every 5000 \
             --only_load_model True \
