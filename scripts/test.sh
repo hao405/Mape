@@ -49,12 +49,14 @@ export NCCL_P2P_DISABLE=0
 # export NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-^lo,docker0}
+export OPTIMIZER=${OPTIMIZER:-muon}
 
 export PROJECT_HOME="/vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl"
 export PYTHONPATH="$PROJECT_HOME:$PYTHONPATH"
 
 echo "[$(date)] MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
 echo "[$(date)] NUM_NODES=$NUM_NODES GPUS_PER_NODE=$GPUS_PER_NODE WORLD_SIZE=$WORLD_SIZE"
+echo "[$(date)] OPTIMIZER=$OPTIMIZER"
 
 ########################################
 # 启动训练
@@ -89,6 +91,7 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --batch_size 256 \
             --micro_batch_size 4 \
             --lr 2e-4 \
+            --optimizer '"${OPTIMIZER}"' \
             --scheduler cosine_warmup \
             --cosine_lr_end 2e-5 \
             --warmup_proportion 0.05 \
