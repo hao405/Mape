@@ -1,5 +1,15 @@
 # This script is used to train TabICL for the first stage of the curriculum learning
 
+# Override any value below with environment variables, e.g.
+#   DTYPE=bfloat16 BATCH_SIZE=128 MICRO_BATCH_SIZE=1 MAX_SEQ_LEN=1024 bash scripts/train_stage1.sh
+
+DTYPE=${DTYPE:-bfloat16}
+BATCH_SIZE=${BATCH_SIZE:-256}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
+BATCH_SIZE_PER_GP=${BATCH_SIZE_PER_GP:-4}
+MAX_SEQ_LEN=${MAX_SEQ_LEN:-1024}
+ROW_ROPE_BASE=${ROW_ROPE_BASE:-100000}
+
 # ----------------------------------
 # Generate prior datasets on the fly
 # ----------------------------------
@@ -11,23 +21,23 @@ torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
             --wandb_dir /my/wandb/dir \
             --wandb_mode online \
             --device cuda \
-            --dtype float32 \
+            --dtype ${DTYPE} \
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 100000 \
-            --batch_size 512 \
-            --micro_batch_size 4 \
+            --batch_size ${BATCH_SIZE} \
+            --micro_batch_size ${MICRO_BATCH_SIZE} \
             --lr 1e-4 \
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
             --gradient_clipping 1.0 \
             --prior_type mix_scm \
             --prior_device cpu \
-            --batch_size_per_gp 4 \
+            --batch_size_per_gp ${BATCH_SIZE_PER_GP} \
             --min_features 2 \
             --max_features 100 \
             --max_classes 10 \
-            --max_seq_len 1024 \
+            --max_seq_len ${MAX_SEQ_LEN} \
             --min_train_size 0.1 \
             --max_train_size 0.9 \
             --embed_dim 128 \
@@ -37,7 +47,7 @@ torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
             --row_num_blocks 3 \
             --row_nhead 8 \
             --row_num_cls 4 \
-            --row_rope_base 100000 \
+            --row_rope_base ${ROW_ROPE_BASE} \
             --icl_num_blocks 12 \
             --icl_nhead 4 \
             --ff_factor 2 \
@@ -58,13 +68,13 @@ python /path/to/tabicl/prior/genload.py \
     --torch_seed 42 \
     --num_batches 100000 \
     --resume_from 0 \
-    --batch_size 512 \
-    --batch_size_per_gp 4 \
+    --batch_size ${BATCH_SIZE} \
+    --batch_size_per_gp ${BATCH_SIZE_PER_GP} \
     --prior_type mix_scm \
     --min_features 2 \
     --max_features 100 \
     --max_classes 10 \
-    --max_seq_len 1024 \
+    --max_seq_len ${MAX_SEQ_LEN} \
     --min_train_size 0.1 \
     --max_train_size 0.9 \
     --n_jobs -1 \
@@ -79,12 +89,12 @@ torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
             --wandb_dir /my/wandb/dir \
             --wandb_mode online \
             --device cuda \
-            --dtype float32 \
+            --dtype ${DTYPE} \
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 100000 \
-            --batch_size 512 \
-            --micro_batch_size 4 \
+            --batch_size ${BATCH_SIZE} \
+            --micro_batch_size ${MICRO_BATCH_SIZE} \
             --lr 1e-4 \
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
@@ -100,7 +110,7 @@ torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
             --row_num_blocks 3 \
             --row_nhead 8 \
             --row_num_cls 4 \
-            --row_rope_base 100000 \
+            --row_rope_base ${ROW_ROPE_BASE} \
             --icl_num_blocks 12 \
             --icl_nhead 4 \
             --ff_factor 2 \
