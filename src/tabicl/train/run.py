@@ -326,18 +326,25 @@ class Trainer:
     def configure_amp(self):
         """Configure automatic mixed precision (AMP) for training."""
 
-        self.amp = self.config.amp and "cuda" in self.config.device
-        self.scaler = torch.GradScaler("cuda", enabled=self.amp)
+        dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        requested_amp_dtype = dtype_map.get(self.config.dtype)
+        use_cuda = "cuda" in self.config.device
+        self.amp = self.config.amp and use_cuda and requested_amp_dtype is not None
+        scaler_enabled = self.amp and requested_amp_dtype == torch.float16
+        self.scaler = torch.GradScaler("cuda", enabled=scaler_enabled)
+
         if self.amp:
+            self.amp_dtype = requested_amp_dtype
             if self.master_process:
-                print(f"Automatic Mixed Precision is enabled.")
-            # self.amp_ctx = torch.autocast(
-            #     device_type="cuda", dtype=torch.float16 if self.config.dtype == "float16" else torch.float32
-            # )
-            self.amp_ctx = torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16 if self.config.dtype == "bfloat16" else torch.float32
-            )
+                print(f"Automatic Mixed Precision is enabled with dtype={self.config.dtype}.")
+            self.amp_ctx = torch.autocast(device_type="cuda", dtype=self.amp_dtype)
         else:
+            self.amp_dtype = torch.float32
+            if self.master_process and self.config.amp and use_cuda and self.config.dtype == "float32":
+                print("AMP disabled because dtype=float32; running in full precision.")
             self.amp_ctx = nullcontext()
 
     def get_latest_checkpoint(self):
@@ -373,14 +380,10 @@ class Trainer:
         """
 
         checkpoint_path = None
-        # checkpoint_path = "/vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl/stabe1/good.ckpt"
         if hasattr(self.config, "checkpoint_path") and self.config.checkpoint_path:
             checkpoint_path = self.config.checkpoint_path
         elif hasattr(self.config, "checkpoint_dir") and self.config.checkpoint_dir:
             checkpoint_path = self.get_latest_checkpoint()
-
-        # checkpoint_path = "/vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl/stabe1/checkpoint/tabicl-classifier-v1.1-0506.ckpt"
-        checkpoint_path = "/vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl/stabe1/checkpoint/dir1/step-100400.ckpt"
         if checkpoint_path is None or not os.path.exists(checkpoint_path):
             print("No checkpoint found, starting from scratch.")
             return
@@ -532,6 +535,27 @@ class Trainer:
                 total_norm += param_norm.item() ** 2
         return total_norm ** 0.5
 
+    def describe_micro_batch(self, micro_batch):
+        """Return the key shape metadata for a micro-batch for OOM diagnostics."""
+        micro_X, _, micro_d, micro_seq_len, micro_train_size = micro_batch
+        seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
+        return {
+            "micro_batch_size": int(micro_X.shape[0]),
+            "padded_seq_len": int(micro_X.shape[1]),
+            "seq_len": int(seq_len),
+            "train_size": int(train_size),
+            "test_size": int(seq_len - train_size),
+            "features": int(micro_d.max().item()),
+        }
+
+    def cleanup_after_failed_micro_batch(self):
+        """Release as much GPU state as possible after a failed micro-batch."""
+        self.optimizer.zero_grad(set_to_none=True)
+        if self.ddp:
+            self.model.require_backward_grad_sync = True
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def run_micro_batch(self, micro_batch, micro_batch_idx, num_micro_batches):
         """
         micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
@@ -651,12 +675,18 @@ class Trainer:
                 for k, v in res.items():
                     results[k] += v
             except torch.cuda.OutOfMemoryError:
-                print(f"OOM in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
-                torch.cuda.empty_cache()
+                oom_info = self.describe_micro_batch(micro)
+                print(
+                    f"OOM in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. "
+                    f"Skipping. Details: batch={oom_info['micro_batch_size']}, seq_len={oom_info['seq_len']}, "
+                    f"train={oom_info['train_size']}, test={oom_info['test_size']}, features={oom_info['features']}."
+                )
+                self.cleanup_after_failed_micro_batch()
                 failed += 1
                 continue
             except FloatingPointError:
                 print(f"Non-finite loss in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
+                self.cleanup_after_failed_micro_batch()
                 failed += 1
                 continue
 
@@ -677,7 +707,19 @@ class Trainer:
             # 没梯度就不更新（但你可以选择仍然 step scheduler；这里保留你的行为）
             self.scaler.update()
             self.scheduler.step()
-            results.update({"grad_norm_pre": 0.0, "grad_norm_post": 0.0, "lr": round(lr, 5), "lr_next": self.optimizer.param_groups[0]["lr"]})
+            if failed and self.master_process:
+                print(
+                    f"Step {self.curr_step}: all {num_micro_batches} micro-batches failed. "
+                    "This is a pure memory/configuration issue, not a checkpoint issue. "
+                    "Reduce per-GPU batch size, lower max_seq_len, or use bfloat16/float16."
+                )
+            results.update({
+                "grad_norm_pre": 0.0,
+                "grad_norm_post": 0.0,
+                "lr": round(lr, 5),
+                "lr_next": self.optimizer.param_groups[0]["lr"],
+                "failed_micro_batches": failed,
+            })
             print(round(lr, 5))
             return results
 
@@ -756,6 +798,7 @@ class Trainer:
             "grad_norm_pre": grad_norm_pre.item(),
             # "grad_norm_post": grad_norm_post.item(),
             "lr": round(lr, 5),
+            "failed_micro_batches": failed,
             # "lr_next": self.optimizer.param_groups[0]["lr"]
         })
         return results
