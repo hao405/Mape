@@ -146,14 +146,40 @@ class Trainer:
         """Set up Weights & Biases logging."""
 
         if self.config.wandb_log and self.master_process:
-            id_path = os.path.join(self.config.checkpoint_dir, "wand_id.txt")
+            checkpoint_dir = self.config.checkpoint_dir
+            if not checkpoint_dir:
+                raise ValueError(
+                    "wandb logging requires --checkpoint_dir to point to a writable directory for wand_id.txt."
+                )
+
+            try:
+                os.makedirs(checkpoint_dir, exist_ok=True)
+            except (OSError, TypeError) as e:
+                raise ValueError(
+                    "wandb logging requires --checkpoint_dir to point to a writable directory for wand_id.txt."
+                ) from e
+
+            wandb_dir = self.config.wandb_dir
+            if wandb_dir is not None:
+                if not wandb_dir:
+                    raise ValueError(
+                        "wandb logging requires --wandb_dir to point to a writable directory."
+                    )
+                try:
+                    os.makedirs(wandb_dir, exist_ok=True)
+                except (OSError, TypeError) as e:
+                    raise ValueError(
+                        "wandb logging requires --wandb_dir to point to a writable directory."
+                    ) from e
+
+            id_path = os.path.join(checkpoint_dir, "wand_id.txt")
             if self.config.wandb_id is None:
                 if os.path.exists(id_path):
                     with open(id_path, "r") as f:
                         self.config.wandb_id = f.read().strip()
 
             self.wandb_run = wandb.init(
-                dir=self.config.wandb_dir,
+                dir=wandb_dir,
                 project=self.config.wandb_project,
                 name=self.config.wandb_name,
                 id=self.config.wandb_id,
