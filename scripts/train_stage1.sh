@@ -46,7 +46,7 @@ torchrun --standalone --nproc_per_node=8 "${TRAIN_RUN}" \
     --torch_seed 42 \
     --max_steps 160000 \
     --batch_size 256 \
-    --micro_batch_size 1 \
+    --micro_batch_size 2 \
     --lr 5e-5 \
     --scheduler cosine_warmup \
     --warmup_proportion 0.05 \
