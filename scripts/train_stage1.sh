@@ -41,7 +41,7 @@ torchrun --standalone --nproc_per_node=8 "${TRAIN_RUN}" \
     --wandb_dir "$WANDB_DIR" \
     --wandb_mode online \
     --device cuda \
-    --dtype float32 \
+    --dtype float16 \
     --np_seed 43 \
     --torch_seed 42 \
     --max_steps 160000 \
