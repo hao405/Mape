@@ -30,7 +30,22 @@ We are continuously improving TabICL, and as a by-product (Great thanks to [Davi
 
 ### Open-source pretraining code 🥳
 
-After intensive refactoring, we fully open-sourced our pretraining code to reproduce our paper. The scripts folder provides the commands for [stage 1](./scripts/train_stage1.sh), [stage 2](./scripts/train_stage2.sh), and [stage 3](./scripts/train_stage3.sh) of curriculum learning.
+After intensive refactoring, we fully open-sourced our pretraining code to reproduce our paper. The scripts folder provides the commands for [stage 1](./scripts/train_stage1.sh), [stage 2](./scripts/train_stage2.sh), and [stage 3](./scripts/train_stage3.sh) of curriculum learning. Before running them, set the output directories explicitly, for example:
+
+```bash
+export WANDB_DIR="$HOME/tabicl/wandb"
+export STAGE1_CHECKPOINT_DIR="$HOME/tabicl/stage1/checkpoints"
+export STAGE1_PRIOR_DIR="$HOME/tabicl/stage1/prior"
+./scripts/train_stage1.sh
+
+export STAGE2_CHECKPOINT_DIR="$HOME/tabicl/stage2/checkpoints"
+export STAGE2_PRIOR_DIR="$HOME/tabicl/stage2/prior"
+./scripts/train_stage2.sh
+
+export STAGE3_CHECKPOINT_DIR="$HOME/tabicl/stage3/checkpoints"
+export STAGE3_PRIOR_DIR="$HOME/tabicl/stage3/prior"
+./scripts/train_stage3.sh
+```
 
 ***05/01/2025***
 

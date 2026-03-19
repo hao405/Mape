@@ -7,6 +7,31 @@ export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 TRAIN_RUN="${REPO_ROOT}/src/tabicl/train/run.py"
 PRIOR_GENLOAD="${REPO_ROOT}/src/tabicl/prior/genload.py"
 
+require_env_dir() {
+    var_name="$1"
+    description="$2"
+    eval "value=\${$var_name:-}"
+
+    if [ -z "$value" ]; then
+        printf '%s\n' "$description" >&2
+        exit 1
+    fi
+}
+
+WANDB_DIR="${WANDB_DIR:-}"
+STAGE1_CHECKPOINT_DIR="${STAGE1_CHECKPOINT_DIR:-}"
+STAGE2_CHECKPOINT_DIR="${STAGE2_CHECKPOINT_DIR:-}"
+STAGE2_PRIOR_DIR="${STAGE2_PRIOR_DIR:-}"
+
+require_env_dir WANDB_DIR "Please set WANDB_DIR to a writable directory."
+require_env_dir STAGE1_CHECKPOINT_DIR "Please set STAGE1_CHECKPOINT_DIR to the directory containing the stage 1 checkpoints."
+require_env_dir STAGE2_CHECKPOINT_DIR "Please set STAGE2_CHECKPOINT_DIR to a writable directory."
+require_env_dir STAGE2_PRIOR_DIR "Please set STAGE2_PRIOR_DIR to a writable directory."
+
+STAGE1_CHECKPOINT_PATH="${STAGE1_CHECKPOINT_DIR}/step-{latest}.ckpt"
+
+mkdir -p "$WANDB_DIR" "$STAGE2_CHECKPOINT_DIR" "$STAGE2_PRIOR_DIR"
+
 # This script is used to train TabICL for the second stage of the curriculum learning
 
 # ----------------------------------
@@ -14,53 +39,53 @@ PRIOR_GENLOAD="${REPO_ROOT}/src/tabicl/prior/genload.py"
 # ----------------------------------
 
 torchrun --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
-            --wandb_log True \
-            --wandb_project TabICL \
-            --wandb_name Stage2 \
-            --wandb_dir /my/wandb/dir \
-            --wandb_mode online \
-            --device cuda \
-            --dtype float32 \
-            --np_seed 42 \
-            --torch_seed 42 \
-            --max_steps 2000 \
-            --batch_size 512 \
-            --micro_batch_size 1 \
-            --lr 2e-5 \
-            --scheduler polynomial_decay_warmup \
-            --warmup_proportion 0 \
-            --poly_decay_lr_end 5e-6 \
-            --poly_decay_power 2.0 \
-            --gradient_clipping 1.0 \
-            --prior_type mix_scm \
-            --prior_device cpu \
-            --batch_size_per_gp 2 \
-            --min_features 2 \
-            --max_features 100 \
-            --max_classes 10 \
-            --min_seq_len 1000 \
-            --max_seq_len 40000 \
-            --log_seq_len True \
-            --seq_len_per_gp True \
-            --min_train_size 0.5 \
-            --max_train_size 0.9 \
-            --embed_dim 128 \
-            --col_num_blocks 3 \
-            --col_nhead 4 \
-            --col_num_inds 128 \
-            --row_num_blocks 3 \
-            --row_nhead 8 \
-            --row_num_cls 4 \
-            --row_rope_base 100000 \
-            --icl_num_blocks 12 \
-            --icl_nhead 4 \
-            --ff_factor 2 \
-            --norm_first True \
-            --checkpoint_dir /my/stage2/checkpoint/dir \
-            --checkpoint_path /my/stage1/checkpoint/dir/step-{latest}.ckpt \
-            --save_temp_every 5 \
-            --save_perm_every 100 \
-            --only_load_model True
+    --wandb_log True \
+    --wandb_project TabICL \
+    --wandb_name Stage2 \
+    --wandb_dir "$WANDB_DIR" \
+    --wandb_mode online \
+    --device cuda \
+    --dtype float32 \
+    --np_seed 42 \
+    --torch_seed 42 \
+    --max_steps 2000 \
+    --batch_size 512 \
+    --micro_batch_size 1 \
+    --lr 2e-5 \
+    --scheduler polynomial_decay_warmup \
+    --warmup_proportion 0 \
+    --poly_decay_lr_end 5e-6 \
+    --poly_decay_power 2.0 \
+    --gradient_clipping 1.0 \
+    --prior_type mix_scm \
+    --prior_device cpu \
+    --batch_size_per_gp 2 \
+    --min_features 2 \
+    --max_features 100 \
+    --max_classes 10 \
+    --min_seq_len 1000 \
+    --max_seq_len 40000 \
+    --log_seq_len True \
+    --seq_len_per_gp True \
+    --min_train_size 0.5 \
+    --max_train_size 0.9 \
+    --embed_dim 128 \
+    --col_num_blocks 3 \
+    --col_nhead 4 \
+    --col_num_inds 128 \
+    --row_num_blocks 3 \
+    --row_nhead 8 \
+    --row_num_cls 4 \
+    --row_rope_base 100000 \
+    --icl_num_blocks 12 \
+    --icl_nhead 4 \
+    --ff_factor 2 \
+    --norm_first True \
+    --checkpoint_dir "$STAGE2_CHECKPOINT_DIR" \
+    --checkpoint_path "$STAGE1_CHECKPOINT_PATH" \
+    --save_temp_every 5 \
+    --save_perm_every 100 \
+    --only_load_model True
 
 
 # ------------------------------------------------------
@@ -69,7 +94,7 @@ torchrun --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
 
 # Saving to disk
 python "${PRIOR_GENLOAD}" \
-    --save_dir /my/stage2/prior/dir \
+    --save_dir "$STAGE2_PRIOR_DIR" \
     --np_seed 42 \
     --torch_seed 42 \
     --num_batches 2000 \
@@ -92,42 +117,42 @@ python "${PRIOR_GENLOAD}" \
 
 # Loading from disk and training
 torchrun --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
-            --wandb_log True \
-            --wandb_project TabICL \
-            --wandb_name Stage2 \
-            --wandb_dir /my/wandb/dir \
-            --wandb_mode online \
-            --device cuda \
-            --dtype float32 \
-            --np_seed 42 \
-            --torch_seed 42 \
-            --max_steps 2000 \
-            --batch_size 512 \
-            --micro_batch_size 1 \
-            --lr 2e-5 \
-            --scheduler polynomial_decay_warmup \
-            --warmup_proportion 0 \
-            --poly_decay_lr_end 5e-6 \
-            --poly_decay_power 2.0 \
-            --gradient_clipping 1.0 \
-            --prior_dir /my/stage2/prior/dir \
-            --load_prior_start 0 \
-            --delete_after_load False \
-            --prior_device cpu \
-            --embed_dim 128 \
-            --col_num_blocks 3 \
-            --col_nhead 4 \
-            --col_num_inds 128 \
-            --row_num_blocks 3 \
-            --row_nhead 8 \
-            --row_num_cls 4 \
-            --row_rope_base 100000 \
-            --icl_num_blocks 12 \
-            --icl_nhead 4 \
-            --ff_factor 2 \
-            --norm_first True \
-            --checkpoint_dir /my/stage2/checkpoint/dir \
-            --checkpoint_path /my/stage1/checkpoint/dir/step-{latest}.ckpt \
-            --save_temp_every 5 \
-            --save_perm_every 100 \
-            --only_load_model True
+    --wandb_log True \
+    --wandb_project TabICL \
+    --wandb_name Stage2 \
+    --wandb_dir "$WANDB_DIR" \
+    --wandb_mode online \
+    --device cuda \
+    --dtype float32 \
+    --np_seed 42 \
+    --torch_seed 42 \
+    --max_steps 2000 \
+    --batch_size 512 \
+    --micro_batch_size 1 \
+    --lr 2e-5 \
+    --scheduler polynomial_decay_warmup \
+    --warmup_proportion 0 \
+    --poly_decay_lr_end 5e-6 \
+    --poly_decay_power 2.0 \
+    --gradient_clipping 1.0 \
+    --prior_dir "$STAGE2_PRIOR_DIR" \
+    --load_prior_start 0 \
+    --delete_after_load False \
+    --prior_device cpu \
+    --embed_dim 128 \
+    --col_num_blocks 3 \
+    --col_nhead 4 \
+    --col_num_inds 128 \
+    --row_num_blocks 3 \
+    --row_nhead 8 \
+    --row_num_cls 4 \
+    --row_rope_base 100000 \
+    --icl_num_blocks 12 \
+    --icl_nhead 4 \
+    --ff_factor 2 \
+    --norm_first True \
+    --checkpoint_dir "$STAGE2_CHECKPOINT_DIR" \
+    --checkpoint_path "$STAGE1_CHECKPOINT_PATH" \
+    --save_temp_every 5 \
+    --save_perm_every 100 \
+    --only_load_model True
