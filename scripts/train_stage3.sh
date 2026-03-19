@@ -1,10 +1,19 @@
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+TRAIN_RUN="${REPO_ROOT}/src/tabicl/train/run.py"
+PRIOR_GENLOAD="${REPO_ROOT}/src/tabicl/prior/genload.py"
+
 # This script is used to train TabICL for the third stage of the curriculum learning
 
 # ----------------------------------
 # Generate prior datasets on the fly
 # ----------------------------------
 
-torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
+torchrun --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
             --wandb_log True \
             --wandb_project TabICL \
             --wandb_name Stage3 \
@@ -59,7 +68,7 @@ torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
 # ------------------------------------------------------
 
 # Saving to disk
-python /path/to/tabicl/prior/genload.py \
+python "${PRIOR_GENLOAD}" \
     --save_dir /my/stage3/prior/dir \
     --np_seed 42 \
     --torch_seed 42 \
@@ -83,7 +92,7 @@ python /path/to/tabicl/prior/genload.py \
     --device cpu
 
 # Loading from disk and training
-torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
+torchrun --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
             --wandb_log True \
             --wandb_project TabICL \
             --wandb_name Stage3 \
