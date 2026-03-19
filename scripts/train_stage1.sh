@@ -34,7 +34,7 @@ mkdir -p "$WANDB_DIR" "$STAGE1_CHECKPOINT_DIR" "$STAGE1_PRIOR_DIR"
 # Generate prior datasets on the fly
 # ----------------------------------
 
-torchrun --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
+torchrun --standalone --nproc_per_node=8 "${TRAIN_RUN}" \
     --wandb_log True \
     --wandb_project TabICL \
     --wandb_name Stage1 \
@@ -102,7 +102,7 @@ python "${PRIOR_GENLOAD}" \
     --device cpu
 
 # Loading from disk and training
-torchrun --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
+torchrun --standalone --nproc_per_node=8 "${TRAIN_RUN}" \
     --wandb_log True \
     --wandb_project TabICL \
     --wandb_name Stage1 \
