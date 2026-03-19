@@ -34,7 +34,7 @@ mkdir -p "$WANDB_DIR" "$STAGE1_CHECKPOINT_DIR" "$STAGE1_PRIOR_DIR"
 # Generate prior datasets on the fly
 # ----------------------------------
 
-torchrun --standalone --nproc_per_node=8 "${TRAIN_RUN}" \
+torchrun --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
     --wandb_log True \
     --wandb_project TabICL \
     --wandb_name Stage1 \
@@ -45,19 +45,19 @@ torchrun --standalone --nproc_per_node=8 "${TRAIN_RUN}" \
     --np_seed 43 \
     --torch_seed 42 \
     --max_steps 160000 \
-    --batch_size 256 \
-    --micro_batch_size 1 \
+    --batch_size 512 \
+    --micro_batch_size 4 \
     --lr 5e-5 \
     --scheduler cosine_warmup \
     --warmup_proportion 0.05 \
     --gradient_clipping 1.0 \
     --prior_type mix_scm \
     --prior_device cpu \
-    --batch_size_per_gp 2 \
+    --batch_size_per_gp 4 \
     --min_features 2 \
     --max_features 100 \
     --max_classes 10 \
-    --max_seq_len 512 \
+    --max_seq_len 2048 \
     --min_train_size 0.1 \
     --max_train_size 0.9 \
     --embed_dim 128 \
@@ -74,7 +74,7 @@ torchrun --standalone --nproc_per_node=8 "${TRAIN_RUN}" \
     --norm_first True \
     --checkpoint_dir "$STAGE1_CHECKPOINT_DIR" \
     --save_temp_every 50 \
-    --save_perm_every 5000
+    --save_perm_every 5000 \
     --only_load_model True \
 
 # # ------------------------------------------------------
