@@ -1,19 +1,31 @@
-# #!/usr/bin/env python3
-# # -*- coding: utf-8 -*-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+TALENT batch evaluation with online checkpoint watching.
 
-# """
-# TALENT batch evaluation with online checkpoint watching.
+This script supports the current TabICL KV cache path at the script level.
 
-# Key behavior:
-# - If `--models_dir` is provided, keep polling this directory.
-# - Whenever a new checkpoint appears and becomes stable, evaluate it once.
-# - Each model evaluation shards datasets across up to 8 GPUs in parallel.
-# - Write per-model outputs:
-#   - <outdir>/<model_tag>/talent_detailed.txt
-#   - <outdir>/<model_tag>/talent_summary.txt
-# - Append global summary:
-#   - <outdir>/all_models_summary.tsv
-# """
+Key behavior:
+- If `--models_dir` is provided, keep polling this directory.
+- Whenever a new checkpoint appears and becomes stable, evaluate it once.
+- Each model evaluation shards datasets across up to 8 GPUs in parallel.
+- `fit()` may prebuild training-side KV cache when KV cache is enabled.
+- `predict()` / `predict_proba()` then reuse the cached training context and only
+  process test samples.
+- KV cache is enabled by default and can be disabled with `--disable_kv_cache`.
+- KV cache is only supported for standard classification where
+  `n_classes <= model.max_classes`.
+- If a dataset exceeds that class limit, the script falls back to the non-cache
+  classifier path by default, or fails fast when
+  `--kv_cache_fail_on_unsupported` is passed.
+- The script-level `_dataset_cache` stores preprocessed train/test arrays and is
+  separate from the classifier-internal `KV cache`.
+
+Outputs:
+- `<outdir>/<model_tag>/talent_detailed.txt`
+- `<outdir>/<model_tag>/talent_summary.txt`
+- `<outdir>/all_models_summary.tsv`
+"""
 
 from __future__ import annotations
 
@@ -28,6 +40,7 @@ import re
 import sys
 import time
 import warnings
+from collections import Counter
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -50,6 +63,7 @@ FIXED_GPUS = 8
 COERCE_NUMERIC = True
 MERGE_VAL = True
 SKIP_REGRESSION = True
+_COMPAT_WARNING_KEYS: set[str] = set()
 
 
 def convert_features(X: np.ndarray, enabled: bool) -> np.ndarray:
@@ -378,11 +392,19 @@ def resolve_gpu_devices(max_gpus: int = FIXED_GPUS) -> List[str]:
     return devices
 
 
+def _warn_compat_once(key: str, message: str) -> None:
+    if key in _COMPAT_WARNING_KEYS:
+        return
+    _COMPAT_WARNING_KEYS.add(key)
+    logging.warning(message)
+
+
 def build_classifier(
     model_path: str,
     n_estimators: int,
     batch_size: Optional[int],
     n_jobs: Optional[int],
+    use_kv_cache: bool,
     use_torch_compile: bool,
     torch_compile_mode: Optional[str],
     torch_compile_backend: Optional[str],
@@ -403,11 +425,18 @@ def build_classifier(
         kwargs["batch_size"] = batch_size
     if n_jobs is not None:
         kwargs["n_jobs"] = n_jobs
+    supports_kv_cache = False
     try:
         sig = inspect.signature(TabICLClassifier.__init__)
         params = sig.parameters
-        if "use_kv_cache" in params:
-            kwargs["use_kv_cache"] = True
+        supports_kv_cache = "use_kv_cache" in params
+        if supports_kv_cache:
+            kwargs["use_kv_cache"] = bool(use_kv_cache)
+        elif use_kv_cache:
+            _warn_compat_once(
+                "tabicl_classifier_missing_use_kv_cache",
+                "当前 TabICLClassifier 版本不支持 `use_kv_cache` 参数，脚本将继续运行，但会忽略 KV cache 请求。",
+            )
         if use_torch_compile and "use_torch_compile" in params:
             kwargs["use_torch_compile"] = True
             if "torch_compile_mode" in params:
@@ -418,9 +447,17 @@ def build_classifier(
                 kwargs["torch_compile_fullgraph"] = torch_compile_fullgraph
             if "torch_compile_dynamic" in params:
                 kwargs["torch_compile_dynamic"] = torch_compile_dynamic
-    except Exception:
-        pass
-    return TabICLClassifier(**kwargs)
+    except Exception as exc:
+        if use_kv_cache:
+            _warn_compat_once(
+                "tabicl_classifier_signature_inspection_failed",
+                f"检查 TabICLClassifier.__init__ 参数失败，脚本将继续运行，但可能无法启用 KV cache: {exc}",
+            )
+    clf = TabICLClassifier(**kwargs)
+    clf._script_requested_use_kv_cache = bool(use_kv_cache)
+    clf._script_supports_use_kv_cache = bool(supports_kv_cache)
+    clf._script_effective_use_kv_cache = bool(use_kv_cache and supports_kv_cache)
+    return clf
 
 
 def preload_model_once(clf, gpu_device: str) -> None:
@@ -590,6 +627,14 @@ def _prepare_dataset_payload(dataset_dir: Path, cache_root: Path):
     )
 
 
+def _classifier_uses_kv_cache(clf) -> bool:
+    return bool(getattr(clf, "use_kv_cache", False) and getattr(clf, "model_kv_cache_", None) is not None)
+
+
+def _get_classifier_n_classes(y: np.ndarray) -> int:
+    return int(np.unique(np.asarray(y)).size)
+
+
 def _worker_loop(
     task_queue,
     result_queue,
@@ -598,6 +643,8 @@ def _worker_loop(
     clf_n_estimators: int,
     clf_batch_size: Optional[int],
     clf_n_jobs: Optional[int],
+    use_kv_cache: bool,
+    kv_cache_fail_on_unsupported: bool,
     cpu_threads: int,
     use_torch_compile: bool,
     torch_compile_mode: Optional[str],
@@ -620,8 +667,7 @@ def _worker_loop(
 
     logging.info("[GPU %s] 启动，常驻worker模式", gpu_device)
 
-    clf = None
-    current_model_path = None
+    classifiers = {}
     cache_root_path = Path(cache_root)
 
     while True:
@@ -633,20 +679,25 @@ def _worker_loop(
         model_path = str(task["model_path"])
         d = Path(task["dataset_dir"])
 
-        if clf is None or current_model_path != model_path:
-            clf = build_classifier(
-                model_path=model_path,
-                n_estimators=clf_n_estimators,
-                batch_size=clf_batch_size,
-                n_jobs=clf_n_jobs,
-                use_torch_compile=use_torch_compile,
-                torch_compile_mode=torch_compile_mode,
-                torch_compile_backend=torch_compile_backend,
-                torch_compile_fullgraph=torch_compile_fullgraph,
-                torch_compile_dynamic=torch_compile_dynamic,
-            )
-            preload_model_once(clf, gpu_device)
-            current_model_path = model_path
+        def get_classifier(request_use_kv_cache: bool):
+            key = (model_path, bool(request_use_kv_cache))
+            clf = classifiers.get(key)
+            if clf is None:
+                clf = build_classifier(
+                    model_path=model_path,
+                    n_estimators=clf_n_estimators,
+                    batch_size=clf_batch_size,
+                    n_jobs=clf_n_jobs,
+                    use_kv_cache=request_use_kv_cache,
+                    use_torch_compile=use_torch_compile,
+                    torch_compile_mode=torch_compile_mode,
+                    torch_compile_backend=torch_compile_backend,
+                    torch_compile_fullgraph=torch_compile_fullgraph,
+                    torch_compile_dynamic=torch_compile_dynamic,
+                )
+                preload_model_once(clf, gpu_device)
+                classifiers[key] = clf
+            return clf
 
         ds_t0 = time.perf_counter()
         try:
@@ -669,20 +720,49 @@ def _worker_loop(
             train_ratio = float(payload["train_ratio"])
 
             prep_time = time.perf_counter() - ds_t0
+            requested_clf = get_classifier(use_kv_cache)
+            active_clf = requested_clf
+            n_classes = _get_classifier_n_classes(y_train)
+            model_max_classes = getattr(getattr(requested_clf, "model_", None), "max_classes", None)
+
+            kv_cache_enabled = bool(use_kv_cache)
+            kv_cache_used = False
+            if not kv_cache_enabled:
+                kv_cache_reason = "disabled_by_cli"
+            elif not getattr(requested_clf, "_script_effective_use_kv_cache", False):
+                kv_cache_reason = "unsupported_classifier_version"
+            else:
+                kv_cache_reason = "enabled"
+                if model_max_classes is not None and n_classes > int(model_max_classes):
+                    message = (
+                        f"{d.name}: KV cache 不支持 many-class/hierarchical 路径，"
+                        f"当前类别数={n_classes}，模型上限={model_max_classes}"
+                    )
+                    if kv_cache_fail_on_unsupported:
+                        raise ValueError(message)
+                    logging.info("[GPU %s] %s，自动降级到非 KV cache 路径。", gpu_device, message)
+                    active_clf = get_classifier(False)
+                    kv_cache_reason = "many_class_fallback"
 
             t_fit = time.perf_counter()
-            clf.fit(X_train, y_train)
+            active_clf.fit(X_train, y_train)
             fit_time = time.perf_counter() - t_fit
+            if kv_cache_reason == "enabled":
+                kv_cache_used = _classifier_uses_kv_cache(active_clf)
+                if not kv_cache_used:
+                    kv_cache_reason = "fit_completed_without_cache"
+            n_classes_after_fit = getattr(active_clf, "n_classes_", n_classes)
 
             t_pred = time.perf_counter()
-            y_pred = clf.predict(X_test)
+            y_pred = active_clf.predict(X_test)
             pred_time = time.perf_counter() - t_pred
 
             acc = float(np.mean(y_pred == y_test))
             infer_time = fit_time + pred_time
             total_e2e = time.perf_counter() - ds_t0
             logging.info(
-                "[GPU %s] %s: acc=%.4f, infer=%.2fs (fit=%.2fs, pred=%.2fs), prep=%.2fs, e2e=%.2fs, train_ratio=%.4f",
+                "[GPU %s] %s: acc=%.4f, infer=%.2fs (fit=%.2fs, pred=%.2fs), prep=%.2fs, e2e=%.2fs, "
+                "train_ratio=%.4f, kv_cache_enabled=%s, kv_cache_used=%s, kv_cache_reason=%s, n_classes=%s/%s",
                 gpu_device,
                 d.name,
                 acc,
@@ -692,6 +772,11 @@ def _worker_loop(
                 prep_time,
                 total_e2e,
                 train_ratio,
+                kv_cache_enabled,
+                kv_cache_used,
+                kv_cache_reason,
+                n_classes_after_fit,
+                model_max_classes,
             )
             result_queue.put(
                 {
@@ -706,6 +791,9 @@ def _worker_loop(
                     "pred_time": pred_time,
                     "total_e2e": total_e2e,
                     "cache_hit": cache_hit,
+                    "kv_cache_enabled": kv_cache_enabled,
+                    "kv_cache_used": kv_cache_used,
+                    "kv_cache_reason": kv_cache_reason,
                 }
             )
 
@@ -729,6 +817,8 @@ class PersistentEvaluatorPool:
         clf_n_estimators: int,
         clf_batch_size: Optional[int],
         clf_n_jobs: Optional[int],
+        use_kv_cache: bool,
+        kv_cache_fail_on_unsupported: bool,
         cpu_threads: int,
         use_torch_compile: bool,
         torch_compile_mode: Optional[str],
@@ -759,6 +849,8 @@ class PersistentEvaluatorPool:
                     clf_n_estimators,
                     clf_batch_size,
                     clf_n_jobs,
+                    use_kv_cache,
+                    kv_cache_fail_on_unsupported,
                     cpu_threads,
                     use_torch_compile,
                     torch_compile_mode,
@@ -772,7 +864,13 @@ class PersistentEvaluatorPool:
             p.start()
             self.processes.append(p)
 
-        logging.info("常驻评测池已启动: %d workers, cache=%s", len(self.processes), self.cache_root)
+        logging.info(
+            "常驻评测池已启动: %d workers, _dataset_cache=%s, kv_cache_default=%s, kv_cache_fail_on_unsupported=%s",
+            len(self.processes),
+            self.cache_root,
+            use_kv_cache,
+            kv_cache_fail_on_unsupported,
+        )
 
     def close(self) -> None:
         for _ in self.processes:
@@ -795,7 +893,10 @@ class PersistentEvaluatorPool:
         done = 0
         skip_count = 0
         err_count = 0
-        cache_hits = 0
+        dataset_cache_hits = 0
+        kv_cache_enabled_count = 0
+        kv_cache_used_count = 0
+        kv_cache_reason_counts: Counter[str] = Counter()
         while done < total_tasks:
             msg = self.result_queue.get()
             if int(msg.get("eval_id", -1)) != eval_id:
@@ -803,20 +904,14 @@ class PersistentEvaluatorPool:
             done += 1
             status = msg.get("status")
             if status == "ok":
-                results.append(
-                    (
-                        msg["dataset"],
-                        float(msg["acc"]),
-                        float(msg["infer_time"]),
-                        float(msg["train_ratio"]),
-                        float(msg["prep_time"]),
-                        float(msg["fit_time"]),
-                        float(msg["pred_time"]),
-                        float(msg["total_e2e"]),
-                    )
-                )
+                results.append(dict(msg))
                 if msg.get("cache_hit"):
-                    cache_hits += 1
+                    dataset_cache_hits += 1
+                if msg.get("kv_cache_enabled"):
+                    kv_cache_enabled_count += 1
+                if msg.get("kv_cache_used"):
+                    kv_cache_used_count += 1
+                kv_cache_reason_counts[str(msg.get("kv_cache_reason", "unknown"))] += 1
             elif status == "skip":
                 skip_count += 1
             else:
@@ -824,13 +919,19 @@ class PersistentEvaluatorPool:
                 logging.warning("数据集失败: %s (%s)", msg.get("dataset"), msg.get("error"))
 
         logging.info(
-            "模型 %s 评测完成: ok=%d, skip=%d, error=%d, cache_hit=%d/%d",
+            "模型 %s 评测完成: ok=%d, skip=%d, error=%d, _dataset_cache_hit=%d/%d, "
+            "kv_cache_enabled=%d/%d, kv_cache_used=%d/%d, kv_cache_reason_counts=%s",
             Path(model_path).stem,
             len(results),
             skip_count,
             err_count,
-            cache_hits,
+            dataset_cache_hits,
             total_tasks,
+            kv_cache_enabled_count,
+            total_tasks,
+            kv_cache_used_count,
+            total_tasks,
+            dict(kv_cache_reason_counts),
         )
         return results
 
@@ -850,27 +951,40 @@ def evaluate_model(
     outdir.mkdir(parents=True, exist_ok=True)
 
     results = evaluator_pool.evaluate_model(model_path=model_path, dirs=dirs)
-    results.sort(key=lambda x: x[0])
+    results.sort(key=lambda x: x["dataset"])
 
     detailed_path = outdir / "talent_detailed.txt"
     summary_path = outdir / "talent_summary.txt"
 
     if results:
         with open(detailed_path, "w") as f:
-            f.write("dataset\taccuracy\ttime_s\ttrain_ratio\tprep_s\tfit_s\tpredict_s\ttotal_e2e_s\n")
-            for name, acc, dur, tr, prep_s, fit_s, pred_s, e2e_s in results:
+            f.write(
+                "dataset\taccuracy\ttime_s\ttrain_ratio\tprep_s\tfit_s\tpredict_s\ttotal_e2e_s\t"
+                "kv_cache_enabled\tkv_cache_used\tkv_cache_reason\n"
+            )
+            for row in results:
+                tr = float(row["train_ratio"])
                 tr_str = f"{tr:.6f}" if tr == tr else "nan"
-                f.write(f"{name}\t{acc:.6f}\t{dur:.3f}\t{tr_str}\t{prep_s:.3f}\t{fit_s:.3f}\t{pred_s:.3f}\t{e2e_s:.3f}\n")
+                f.write(
+                    f'{row["dataset"]}\t{float(row["acc"]):.6f}\t{float(row["infer_time"]):.3f}\t{tr_str}\t'
+                    f'{float(row["prep_time"]):.3f}\t{float(row["fit_time"]):.3f}\t{float(row["pred_time"]):.3f}\t'
+                    f'{float(row["total_e2e"]):.3f}\t{str(bool(row.get("kv_cache_enabled"))).lower()}\t'
+                    f'{str(bool(row.get("kv_cache_used"))).lower()}\t{row.get("kv_cache_reason", "unknown")}\n'
+                )
 
-        total_time = sum(dur for _, _, dur, _, _, _, _, _ in results)
+        total_time = sum(float(row["infer_time"]) for row in results)
         avg_time = total_time / len(results)
-        avg_acc = sum(acc for _, acc, _, _, _, _, _, _ in results) / len(results)
-        tr_values = [tr for _, _, _, tr, _, _, _, _ in results if tr == tr]
-        avg_prep_time = sum(prep for _, _, _, _, prep, _, _, _ in results) / len(results)
-        avg_fit_time = sum(fit for _, _, _, _, _, fit, _, _ in results) / len(results)
-        avg_pred_time = sum(pred for _, _, _, _, _, _, pred, _ in results) / len(results)
-        avg_e2e_time = sum(e2e for _, _, _, _, _, _, _, e2e in results) / len(results)
+        avg_acc = sum(float(row["acc"]) for row in results) / len(results)
+        tr_values = [float(row["train_ratio"]) for row in results if float(row["train_ratio"]) == float(row["train_ratio"])]
+        avg_prep_time = sum(float(row["prep_time"]) for row in results) / len(results)
+        avg_fit_time = sum(float(row["fit_time"]) for row in results) / len(results)
+        avg_pred_time = sum(float(row["pred_time"]) for row in results) / len(results)
+        avg_e2e_time = sum(float(row["total_e2e"]) for row in results) / len(results)
         avg_train_ratio = (sum(tr_values) / len(tr_values)) if tr_values else float("nan")
+        kv_cache_enabled_count = sum(bool(row.get("kv_cache_enabled")) for row in results)
+        kv_cache_used_count = sum(bool(row.get("kv_cache_used")) for row in results)
+        kv_cache_reason_counts = Counter(str(row.get("kv_cache_reason", "unknown")) for row in results)
+        kv_cache_fallback_count = int(kv_cache_reason_counts.get("many_class_fallback", 0))
 
         with open(summary_path, "w") as f:
             f.write(f"Model: {model_tag}\n")
@@ -883,6 +997,12 @@ def evaluate_model(
             f.write(f"Average predict time s: {avg_pred_time:.3f}\n")
             f.write(f"Average end-to-end time s: {avg_e2e_time:.3f}\n")
             f.write(f"Average train_ratio: {avg_train_ratio:.6f}\n")
+            f.write(f"KV cache requested datasets: {kv_cache_enabled_count}/{len(results)}\n")
+            f.write(f"KV cache used datasets: {kv_cache_used_count}/{len(results)}\n")
+            f.write(f"KV cache fallback datasets: {kv_cache_fallback_count}/{len(results)}\n")
+            f.write(f"KV cache requested ratio: {kv_cache_enabled_count / len(results):.6f}\n")
+            f.write(f"KV cache used ratio: {kv_cache_used_count / len(results):.6f}\n")
+            f.write(f"KV cache reason counts: {json.dumps(dict(kv_cache_reason_counts), ensure_ascii=False, sort_keys=True)}\n")
 
         logging.info("[%s] 汇总完成：%s / %s", model_tag, detailed_path, summary_path)
         return model_tag, len(results), avg_acc, total_time, avg_time, avg_train_ratio
@@ -1047,7 +1167,12 @@ def evaluate_once(
 
 
 def parse_args():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=(
+            "TALENT 批量评测脚本。默认启用 TabICL KV cache：fit() 预建训练侧 KV cache，"
+            "predict() 只处理 test。_dataset_cache 是脚本层预处理缓存，与分类器内部 KV cache 不同。"
+        )
+    )
     ap.add_argument("--model_path", type=str, default=None, help="单个模型路径（与 --models_dir 互斥）")
     ap.add_argument("--models_dir", type=str, default=None, help="checkpoint目录，开启在线轮询评测")
     ap.add_argument("--data_root", type=str, default=DEFAULT_DATA_ROOT)
@@ -1085,13 +1210,23 @@ def parse_args():
         "--cache_root",
         type=str,
         default=None,
-        help="预处理数据缓存目录，默认 <outdir>/_dataset_cache",
+        help="脚本层预处理数据缓存目录，默认 <outdir>/_dataset_cache；与分类器内部 KV cache 不同",
     )
     ap.add_argument(
         "--tested_log",
         type=str,
         default=None,
         help="已评测checkpoint记录文件，默认 <outdir>/tested_ckpts.txt",
+    )
+    ap.add_argument(
+        "--disable_kv_cache",
+        action="store_true",
+        help="关闭 KV cache。默认不传时启用：fit() 预建训练侧 KV cache，predict() 只跑 test。",
+    )
+    ap.add_argument(
+        "--kv_cache_fail_on_unsupported",
+        action="store_true",
+        help="若数据集触发 many-class / hierarchical 路径且 KV cache 不支持，则直接报错；默认自动降级到非 KV cache 路径。",
     )
     return ap.parse_args()
 
@@ -1107,6 +1242,8 @@ def main():
     tested_log = Path(args.tested_log) if args.tested_log else (outdir_root / "tested_ckpts.txt")
     clf_batch_size = None if int(args.clf_batch_size) <= 0 else int(args.clf_batch_size)
     clf_n_jobs = None if int(args.clf_n_jobs) <= 0 else int(args.clf_n_jobs)
+    use_kv_cache = not bool(args.disable_kv_cache)
+    kv_cache_fail_on_unsupported = bool(args.kv_cache_fail_on_unsupported)
     cpu_threads = max(1, int(args.cpu_threads))
     cache_root = Path(args.cache_root) if args.cache_root else (outdir_root / "_dataset_cache")
     use_torch_compile = bool(args.use_torch_compile)
@@ -1131,6 +1268,11 @@ def main():
     if not gpu_devices:
         raise RuntimeError("未检测到可用GPU设备，无法执行并行评测。")
     logging.info("常驻评测池使用 %d 张GPU: %s", len(gpu_devices), ",".join(gpu_devices))
+    logging.info(
+        "KV cache 配置: enabled=%s, fail_on_unsupported=%s。注意：_dataset_cache 是脚本层数据缓存，KV cache 是分类器内部训练侧推理缓存。",
+        use_kv_cache,
+        kv_cache_fail_on_unsupported,
+    )
     if use_torch_compile:
         logging.info(
             "torch.compile 已开启: mode=%s, backend=%s, fullgraph=%s, dynamic=%s, cache=%s",
@@ -1147,6 +1289,8 @@ def main():
         clf_n_estimators=int(args.clf_n_estimators),
         clf_batch_size=clf_batch_size,
         clf_n_jobs=clf_n_jobs,
+        use_kv_cache=use_kv_cache,
+        kv_cache_fail_on_unsupported=kv_cache_fail_on_unsupported,
         cpu_threads=cpu_threads,
         use_torch_compile=use_torch_compile,
         torch_compile_mode=torch_compile_mode,

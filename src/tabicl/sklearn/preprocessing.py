@@ -994,43 +994,45 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
 
         return ensemble_configs, shuffle_patterns, shift_offsets
 
-    def transform(self, X):
-        """Combines training and test data to create different in-context learning prompts.
-
-        For each normalization method:
-        1. Preprocesses data once using the fitted pipeline for that method
-        2. Applies each feature permutation and class shift within that method's group
-
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            Test input data to be combined with training data.
-
-        Returns
-        -------
-        OrderedDict
-            Dictionary mapping normalization methods to tuples of (X_ensemble, y_ensemble) where:
-            - X_ensemble: array of shape (n_variants_for_method, n_samples_combined, n_features)
-              Contains the preprocessed and feature-permuted combined data
-            - y_ensemble: array of shape (n_variants_for_method, n_samples_train)
-              Contains the class-shifted training labels
-        """
+    def transform(self, X=None, mode="both"):
+        """Create ensemble data variants for train/test/cache workflows."""
 
         check_is_fitted(self, ["ensemble_configs_"])
+        assert mode in ("both", "train", "test"), f"Invalid mode: {mode}"
 
-        # Unique feature filtering
-        X = self.unique_filter_.transform(X)
         y = self.y_
+
+        if mode == "train":
+            data = OrderedDict()
+            for norm_method, shuffle_shift_configs in self.ensemble_configs_.items():
+                X_preprocessed = self.preprocessors_[norm_method].X_transformed_
+                X_ensemble = []
+                y_ensemble = []
+                for shuffle_pattern, shift_offset in shuffle_shift_configs:
+                    X_ensemble.append(X_preprocessed[:, shuffle_pattern])
+                    y_ensemble.append((y + shift_offset) % self.n_classes_)
+                data[norm_method] = (np.stack(X_ensemble, axis=0), np.stack(y_ensemble, axis=0))
+            return data
+
+        if X is None:
+            raise ValueError("X must be provided when mode is 'both' or 'test'")
+
+        X = self.unique_filter_.transform(X)
+
+        if mode == "test":
+            data = OrderedDict()
+            for norm_method, shuffle_shift_configs in self.ensemble_configs_.items():
+                X_test = self.preprocessors_[norm_method].transform(X)
+                X_ensemble = []
+                for shuffle_pattern, _ in shuffle_shift_configs:
+                    X_ensemble.append(X_test[:, shuffle_pattern])
+                data[norm_method] = (np.stack(X_ensemble, axis=0),)
+            return data
 
         data = OrderedDict()
         for norm_method, shuffle_shift_configs in self.ensemble_configs_.items():
-            # Apply preprocessing
             preprocessor = self.preprocessors_[norm_method]
-            X_variant = np.concatenate(
-                [preprocessor.X_transformed_, preprocessor.transform(X)],
-                axis=0,
-            )
-            # Shuffle features and shift class labels
+            X_variant = np.concatenate([preprocessor.X_transformed_, preprocessor.transform(X)], axis=0)
             X_ensemble = []
             y_ensemble = []
             for shuffle_pattern, shift_offset in shuffle_shift_configs:

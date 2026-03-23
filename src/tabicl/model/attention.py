@@ -1,10 +1,11 @@
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from .kv_cache import KVCacheEntry
 from .rope import RotaryEmbedding
 
 
@@ -59,19 +60,21 @@ def sdpa_with_flattened_batch(
 
 def multi_head_attention_forward(
     query: Tensor,
-    key: Tensor,
-    value: Tensor,
     num_heads: int,
     in_proj_weight: Tensor,
     in_proj_bias: Tensor,
     dropout_p: float,
     out_proj_weight: Tensor,
     out_proj_bias: Tensor,
+    key: Optional[Tensor] = None,
+    value: Optional[Tensor] = None,
+    cached_kv: Optional[KVCacheEntry] = None,
     training: bool = True,
     key_padding_mask: Optional[Tensor] = None,
     attn_mask: Optional[Tensor | int] = None,
     rope: Optional[RotaryEmbedding] = None,
-) -> Tensor:
+    need_kv: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
     """Multi-head attention with support for rotary position embeddings
     as well as specialized processing when attn_mask is an integer.
 
@@ -133,27 +136,42 @@ def multi_head_attention_forward(
     if isinstance(attn_mask, int):
         assert key_padding_mask is None, "key_padding_mask is not supported with attn_mask as int"
         assert rope is None, "Rotary position embedding is not supported with attn_mask as int"
+        assert cached_kv is None, "cached_kv is not supported with attn_mask as int"
+        assert key is not None and value is not None, "key and value are required with attn_mask as int"
+        assert not need_kv, "need_kv is not supported with attn_mask as int"
 
     # Extract shape information, supporting arbitrary batch dimensions
     *batch_shape, tgt_len, embed_dim = query.shape
-    src_len = key.shape[-2]
 
     head_dim = embed_dim // num_heads
     assert head_dim * num_heads == embed_dim, f"embed_dim {embed_dim} not divisible by num_heads {num_heads}"
-    assert key.shape == value.shape, f"key shape {key.shape} does not match value shape {value.shape}"
 
-    # Joint projection of query, key, value
-    q, k, v = F._in_projection_packed(query, key, value, in_proj_weight, in_proj_bias)
+    if cached_kv is None:
+        if key is None or value is None:
+            raise ValueError("key and value must be provided when cached_kv is None")
+        src_len = key.shape[-2]
+        assert key.shape == value.shape, f"key shape {key.shape} does not match value shape {value.shape}"
 
-    # Reshape for multi-head attention
-    q = q.view(*batch_shape, tgt_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, tgt_len, hs)
-    k = k.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, src_len, hs)
-    v = v.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, src_len, hs)
+        q, k, v = F._in_projection_packed(query, key, value, in_proj_weight, in_proj_bias)
+        q = q.view(*batch_shape, tgt_len, num_heads, head_dim).transpose(-3, -2)
+        k = k.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)
+        v = v.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)
 
-    # Apply rotary position embeddings if provided
-    if rope is not None:
-        q = rope.rotate_queries_or_keys(q)
-        k = rope.rotate_queries_or_keys(k)
+        if rope is not None:
+            q = rope.rotate_queries_or_keys(q)
+            k = rope.rotate_queries_or_keys(k)
+    else:
+        k, v = cached_kv.key, cached_kv.value
+        if k is None or v is None:
+            raise ValueError("cached_kv must contain both key and value")
+        src_len = k.shape[-2]
+        q_proj_weight = in_proj_weight[:embed_dim]
+        q_proj_bias = in_proj_bias[:embed_dim] if in_proj_bias is not None else None
+        q = F.linear(query, q_proj_weight, q_proj_bias)
+        q = q.view(*batch_shape, tgt_len, num_heads, head_dim).transpose(-3, -2)
+
+        if rope is not None:
+            q = rope.rotate_queries_or_keys(q)
 
     # Disable dropout during evaluation
     if not training:
@@ -218,5 +236,8 @@ def multi_head_attention_forward(
         # Reshape and project output
         attn_output = attn_output.transpose(-3, -2).contiguous().view(*batch_shape, tgt_len, embed_dim)
         attn_output = F.linear(attn_output, out_proj_weight, out_proj_bias)  # (batch_shape, tgt_len, E)
+
+    if need_kv and cached_kv is None:
+        return attn_output, k, v
 
     return attn_output

@@ -14,6 +14,7 @@ from scipy.optimize import fsolve
 import torch
 from torch import Tensor
 
+from .kv_cache import KVCache
 
 class MemoryEstimator:
     """Estimates peak activation memory requirements for different attention-based components.
@@ -241,6 +242,14 @@ class InferenceManager:
             return tensor.to(self.exe_device)
         return tensor
 
+    def prepare_input_value(self, value: Any) -> Any:
+        """Move supported input values to the execution device."""
+        if isinstance(value, torch.Tensor):
+            return self.to_exe_device(value)
+        if isinstance(value, KVCache) and value.is_populated():
+            return value.to(self.exe_device)
+        return value
+
     def get_available_cpu_memory(self) -> float:
         """Get available CPU memory in MB.
 
@@ -360,12 +369,7 @@ class InferenceManager:
 
         if not auto_batch:
             # Move inputs to execution device
-            inputs_on_exe = {}
-            for name, value in inputs.items():
-                if isinstance(value, torch.Tensor):
-                    inputs_on_exe[name] = self.to_exe_device(value)
-                else:
-                    inputs_on_exe[name] = value
+            inputs_on_exe = {name: self.prepare_input_value(value) for name, value in inputs.items()}
 
             with torch.no_grad():
                 if self.use_amp and self.exe_device.type == "cuda":
@@ -449,12 +453,7 @@ class InferenceManager:
         # If we can process all data in one batch, do it
         if batch_size >= total_bs:
             # Move inputs to execution device
-            inputs_on_exe = {}
-            for name, value in inputs.items():
-                if isinstance(value, torch.Tensor):
-                    inputs_on_exe[name] = self.to_exe_device(value)
-                else:
-                    inputs_on_exe[name] = value
+            inputs_on_exe = {name: self.prepare_input_value(value) for name, value in inputs.items()}
 
             with torch.no_grad():
                 if self.use_amp and self.exe_device.type == "cuda":
@@ -474,6 +473,7 @@ class InferenceManager:
         outputs = torch.empty(output_shape, dtype=input_dtype, device=output_device)
 
         # Main inference loop with OOM recovery
+        store_cache_keys = {name for name, value in inputs.items() if isinstance(value, KVCache) and not value.is_populated()}
         while True:
             try:
                 # Calculate how to split batch dimensions based on estimated batch size
@@ -502,6 +502,14 @@ class InferenceManager:
                         else:
                             outputs[indices] = output
 
+                    for cache_key in store_cache_keys:
+                        batch_cache = batch_dict[cache_key]
+                        if batch_cache.is_populated():
+                            original_cache = inputs[cache_key]
+                            if not original_cache.is_populated():
+                                original_cache.preallocate(batch_cache, tuple(batch_dims), device=self.exe_device)
+                            original_cache[indices] = batch_cache
+
                     # Delete batch to free memory
                     del batch_dict
 
@@ -518,6 +526,9 @@ class InferenceManager:
                         f"OOM with batch_size={batch_size} for {self.enc_name}, "
                         f"reducing to {max(self.min_batch_size, batch_size // 2)}"
                     )
+
+                for cache_key in store_cache_keys:
+                    inputs[cache_key].kv.clear()
 
                 # Clear CUDA memory and reduce batch size
                 if self.exe_device.type == "cuda":
@@ -633,6 +644,11 @@ class InferenceManager:
                 if isinstance(value, torch.Tensor):
                     # Move slice to execution device
                     batch_dict[name] = self.to_exe_device(value[slice_tuple])
+                elif isinstance(value, KVCache):
+                    if value.is_populated():
+                        batch_dict[name] = value[slice_tuple].to(self.exe_device)
+                    else:
+                        batch_dict[name] = KVCache()
                 else:
                     # Non-tensor values are passed as is
                     batch_dict[name] = value

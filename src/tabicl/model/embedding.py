@@ -6,6 +6,7 @@ from collections import OrderedDict
 import torch
 from torch import nn, Tensor
 
+from .kv_cache import KVCache
 from .layers import SkippableLinear
 from .encoders import SetTransformer
 from .inference import InferenceManager
@@ -143,6 +144,26 @@ class ColEmbedding(nn.Module):
         embeddings = features * weights + biases
 
         return embeddings
+
+    def _compute_embeddings_with_cache(
+        self,
+        features: Tensor,
+        col_cache: KVCache,
+        train_size: Optional[int] = None,
+        use_cache: bool = False,
+        store_cache: bool = True,
+    ) -> Tensor:
+        src = self.in_linear(features)
+        src = self.tf_col.forward_with_cache(
+            src,
+            col_cache=col_cache,
+            train_size=train_size,
+            use_cache=use_cache,
+            store_cache=store_cache,
+        )
+        weights = self.ln_w(self.out_w(src))
+        biases = self.ln_b(self.out_b(src))
+        return features * weights + biases
 
     def _train_forward(self, X: Tensor, d: Optional[Tensor] = None, train_size: Optional[int] = None) -> Tensor:
         """Transform input table into embeddings for training.
@@ -282,6 +303,51 @@ class ColEmbedding(nn.Module):
                 embeddings[i] = first_embeddings[mapping]
 
         return embeddings.transpose(1, 2)  # (B, T, H+C, E)
+
+    def forward_with_cache(
+        self,
+        X: Tensor,
+        col_cache: KVCache,
+        train_size: Optional[int] = None,
+        use_cache: bool = False,
+        store_cache: bool = True,
+        mgr_config: MgrConfig = None,
+    ) -> Tensor:
+        if use_cache == store_cache:
+            raise ValueError("Exactly one of use_cache or store_cache must be True")
+        if store_cache and train_size is None:
+            raise ValueError("train_size must be provided when store_cache=True")
+
+        if mgr_config is None:
+            mgr_config = MgrConfig(
+                min_batch_size=1,
+                safety_factor=0.8,
+                offload="auto",
+                auto_offload_pct=0.5,
+                device=None,
+                use_amp=True,
+                verbose=False,
+            )
+        self.inference_mgr.configure(**mgr_config)
+
+        if self.reserve_cls_tokens > 0:
+            X = nn.functional.pad(X, (self.reserve_cls_tokens, 0), value=-100.0)
+
+        features = X.transpose(1, 2).unsqueeze(-1)
+        embeddings = self.inference_mgr(
+            self._compute_embeddings_with_cache,
+            inputs=OrderedDict(
+                [
+                    ("features", features),
+                    ("col_cache", col_cache),
+                    ("train_size", train_size),
+                    ("use_cache", use_cache),
+                    ("store_cache", store_cache),
+                ]
+            ),
+        )
+
+        return embeddings.transpose(1, 2)
 
     def forward(
         self,

@@ -1,12 +1,83 @@
 from __future__ import annotations
 
 from typing import Optional, List
+import torch
 from torch import nn, Tensor
 
 from .embedding import ColEmbedding
 from .interaction import RowInteraction
+from .kv_cache import TabICLCache
 from .learning import ICLearning
 from .inference_config import InferenceConfig
+
+
+def _initialize_tabicl_cache(X_train: Tensor, y_train: Tensor) -> TabICLCache:
+    num_classes = len(torch.unique(y_train[0]))
+    return TabICLCache(train_shape=tuple(X_train.shape), num_classes=num_classes)
+
+
+def _forward_with_explicit_cache(
+    model: "TabICL",
+    cache: TabICLCache,
+    X_train: Optional[Tensor] = None,
+    y_train: Optional[Tensor] = None,
+    X_test: Optional[Tensor] = None,
+    return_logits: bool = True,
+    softmax_temperature: float = 0.9,
+    use_cache: bool = False,
+    store_cache: bool = True,
+    inference_config: Optional[InferenceConfig] = None,
+) -> Optional[Tensor]:
+    if cache is None:
+        raise ValueError("cache must be provided")
+    if use_cache == store_cache:
+        raise ValueError("Exactly one of use_cache or store_cache must be True")
+
+    if inference_config is None:
+        inference_config = InferenceConfig()
+
+    if store_cache:
+        if X_train is None or y_train is None:
+            raise ValueError("X_train and y_train must be provided when store_cache=True")
+        X = X_train if X_test is None else torch.cat([X_train, X_test], dim=1)
+        train_size = y_train.shape[1]
+    else:
+        if X_test is None:
+            raise ValueError("X_test must be provided when use_cache=True")
+        if cache is None or cache.is_empty():
+            raise ValueError("No populated cache is available")
+        X = X_test
+        train_size = None
+        y_train = None
+
+    representations = model.row_interactor(
+        model.col_embedder.forward_with_cache(
+            X,
+            col_cache=cache.col_cache,
+            train_size=train_size,
+            use_cache=use_cache,
+            store_cache=store_cache,
+            mgr_config=inference_config.COL_CONFIG,
+        ),
+        mgr_config=inference_config.ROW_CONFIG,
+    )
+
+    out = model.icl_predictor.forward_with_cache(
+        representations,
+        icl_cache=cache.icl_cache,
+        y_train=y_train,
+        num_classes=cache.num_classes,
+        return_logits=return_logits,
+        softmax_temperature=softmax_temperature,
+        use_cache=use_cache,
+        store_cache=store_cache,
+        mgr_config=inference_config.ICL_CONFIG,
+    )
+
+    if store_cache and X_test is None:
+        return None
+
+    return out
 
 
 class TabICL(nn.Module):
@@ -142,6 +213,7 @@ class TabICL(nn.Module):
             activation=activation,
             norm_first=norm_first,
         )
+        self._cache: Optional[TabICLCache] = None
 
     def _train_forward(
         self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
@@ -336,5 +408,50 @@ class TabICL(nn.Module):
                 softmax_temperature=softmax_temperature,
                 inference_config=inference_config,
             )
+
+        return out
+
+    def clear_cache(self) -> None:
+        self._cache = None
+
+    def forward_with_cache(
+        self,
+        X_train: Optional[Tensor] = None,
+        y_train: Optional[Tensor] = None,
+        X_test: Optional[Tensor] = None,
+        return_logits: bool = True,
+        softmax_temperature: float = 0.9,
+        use_cache: bool = False,
+        store_cache: bool = True,
+        cache: Optional[TabICLCache] = None,
+        inference_config: Optional[InferenceConfig] = None,
+    ) -> Optional[Tensor]:
+        local_cache = cache
+        if local_cache is not None:
+            use_cache = True
+            store_cache = False
+        elif store_cache:
+            if X_train is None or y_train is None:
+                raise ValueError("X_train and y_train must be provided when store_cache=True")
+            local_cache = _initialize_tabicl_cache(X_train, y_train)
+            self._cache = local_cache
+        else:
+            local_cache = self._cache
+
+        out = _forward_with_explicit_cache(
+            self,
+            cache=local_cache,
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            return_logits=return_logits,
+            softmax_temperature=softmax_temperature,
+            use_cache=use_cache,
+            store_cache=store_cache,
+            inference_config=inference_config,
+        )
+
+        if cache is None:
+            self._cache = local_cache
 
         return out

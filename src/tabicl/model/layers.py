@@ -1,10 +1,11 @@
 from __future__ import annotations
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 
+from .kv_cache import KVCache, KVCacheEntry
 from .rope import RotaryEmbedding
 from .attention import multi_head_attention_forward
 
@@ -254,12 +255,14 @@ class MultiheadAttention(nn.MultiheadAttention):
     def forward(
         self,
         query: Tensor,
-        key: Tensor,
-        value: Tensor,
+        key: Optional[Tensor] = None,
+        value: Optional[Tensor] = None,
+        cached_kv: Optional[KVCacheEntry] = None,
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
         rope: Optional[RotaryEmbedding] = None,
-    ) -> Tensor:
+        need_kv: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
         """Compute multi-head attention with support for rotary positional encoding.
 
         Parameters
@@ -299,21 +302,24 @@ class MultiheadAttention(nn.MultiheadAttention):
         if isinstance(attn_mask, int):
             assert key_padding_mask is None, "key_padding_mask is not supported with attn_mask as int"
             assert rope is None, "Rotary position embedding is not supported with attn_mask as int"
+            assert cached_kv is None, "cached_kv is not supported with attn_mask as int"
 
         return multi_head_attention_forward(
             query,
-            key,
-            value,
             self.num_heads,
             self.in_proj_weight,
             self.in_proj_bias,
             self.dropout,
             self.out_proj.weight,
             self.out_proj.bias,
+            key=key,
+            value=value,
+            cached_kv=cached_kv,
             training=self.training,
             key_padding_mask=key_padding_mask,
             attn_mask=attn_mask,
             rope=rope,
+            need_kv=need_kv,
         )
 
 
@@ -368,10 +374,13 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         q: Tensor,
         k: Optional[Tensor] = None,
         v: Optional[Tensor] = None,
+        cached_kv: Optional[KVCacheEntry] = None,
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
+        train_size: Optional[int] = None,
         rope: Optional[RotaryEmbedding] = None,
-    ) -> Tensor:
+        need_kv: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
         """Process input through attention with optional rotary positional encoding.
 
         Parameters
@@ -431,36 +440,100 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
                 check_other=False,
             )
 
-        # Use q as k,v if not provided
-        k = q if k is None else k
-        v = q if v is None else v
+        if train_size is not None:
+            assert attn_mask is None, "attn_mask must be None when train_size is provided"
+            assert k is None and v is None, "k and v must be None when train_size is provided"
+            k = v = q[..., :train_size, :]
+        else:
+            k = q if k is None else k
+            v = q if v is None else v
 
         # Apply layer depending on normalization order
         x = q
+        k_proj = v_proj = None
+        use_cache = cached_kv is not None
         if self.norm_first:
             # Pre-norm: normalize before attention and FFN
-            attn = self._attn_block(self.norm1(q), self.norm1(k), self.norm1(v), key_padding_mask, attn_mask, rope)
+            q_normed = self.norm1(q)
+            if use_cache:
+                attn = self._attn_block(
+                    q_normed,
+                    cached_kv=cached_kv,
+                    key_padding_mask=key_padding_mask,
+                    attn_mask=attn_mask,
+                    rope=rope,
+                )
+            else:
+                if train_size is None:
+                    k_normed = self.norm1(k) if k is not q else q_normed
+                    v_normed = self.norm1(v) if v is not k else k_normed
+                else:
+                    k_normed = q_normed[..., :train_size, :]
+                    v_normed = k_normed
+                attn_result = self._attn_block(
+                    q_normed,
+                    k_normed,
+                    v_normed,
+                    key_padding_mask=key_padding_mask,
+                    attn_mask=attn_mask,
+                    rope=rope,
+                    need_kv=need_kv,
+                )
+                if need_kv and isinstance(attn_result, tuple):
+                    attn, k_proj, v_proj = attn_result
+                else:
+                    attn = attn_result
             x = x + attn
             x = x + self._ff_block(self.norm2(x))
         else:
             # Post-norm: normalize after attention and FFN
-            attn = self._attn_block(q, k, v, key_padding_mask, attn_mask, rope)
+            attn_result = self._attn_block(
+                q,
+                k if not use_cache else None,
+                v if not use_cache else None,
+                cached_kv=cached_kv,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                rope=rope,
+                need_kv=need_kv,
+            )
+            if need_kv and not use_cache and isinstance(attn_result, tuple):
+                attn, k_proj, v_proj = attn_result
+            else:
+                attn = attn_result
             x = self.norm1(x + attn)
             x = self.norm2(x + self._ff_block(x))
+
+        if need_kv and not use_cache and k_proj is not None and v_proj is not None:
+            return x, k_proj, v_proj
 
         return x
 
     def _attn_block(
         self,
         q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        key_padding_mask: Optional[Tensor],
-        attn_mask: Optional[Tensor | int],
-        rope: Optional[RotaryEmbedding],
-    ) -> Tensor:
-        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope)
-        return self.dropout1(attn)
+        k: Optional[Tensor] = None,
+        v: Optional[Tensor] = None,
+        cached_kv: Optional[KVCacheEntry] = None,
+        key_padding_mask: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor | int] = None,
+        rope: Optional[RotaryEmbedding] = None,
+        need_kv: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
+        result = self.attn(
+            q,
+            k,
+            v,
+            cached_kv=cached_kv,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+            rope=rope,
+            need_kv=need_kv,
+        )
+        if need_kv and isinstance(result, tuple):
+            attn, k_proj, v_proj = result
+            return self.dropout1(attn), k_proj, v_proj
+        return self.dropout1(result)
 
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
@@ -593,4 +666,52 @@ class InducedSelfAttentionBlock(nn.Module):
         else:
             out = self.induced_attention(src, train_size)
 
+        return out
+
+    def induced_attention_with_cache(
+        self,
+        src: Tensor,
+        col_cache: KVCache,
+        block_idx: int,
+        train_size: Optional[int] = None,
+        use_cache: bool = False,
+        store_cache: bool = True,
+    ) -> Tensor:
+        *batch_shape, _, d_model = src.shape
+        ind_vectors = self.ind_vectors.expand(*batch_shape, self.num_inds, d_model)
+
+        if use_cache:
+            if block_idx not in col_cache.kv:
+                raise ValueError(f"Missing cached KV for ISAB block {block_idx}")
+            return self.multihead_attn2(src, cached_kv=col_cache.kv[block_idx])
+
+        if train_size is None:
+            raise ValueError("train_size must be provided when store_cache=True")
+
+        hidden = self.multihead_attn1(ind_vectors, src[..., :train_size, :], src[..., :train_size, :])
+        out, k_proj, v_proj = self.multihead_attn2(src, hidden, hidden, need_kv=True)
+        col_cache.kv[block_idx] = KVCacheEntry(key=k_proj, value=v_proj)
+        return out
+
+    def forward_with_cache(
+        self,
+        src: Tensor,
+        col_cache: KVCache,
+        block_idx: int,
+        train_size: Optional[int] = None,
+        use_cache: bool = False,
+        store_cache: bool = True,
+    ) -> Tensor:
+        if use_cache == store_cache:
+            raise ValueError("Exactly one of use_cache or store_cache must be True")
+        if store_cache and train_size is None:
+            raise ValueError("train_size must be provided when store_cache=True")
+
+        skip_mask = (src == self.skip_value).all(dim=(-2, -1))
+        if skip_mask.all():
+            return torch.full_like(src, self.skip_value)
+
+        out = self.induced_attention_with_cache(src, col_cache, block_idx, train_size, use_cache, store_cache)
+        if skip_mask.any():
+            out[skip_mask] = self.skip_value
         return out

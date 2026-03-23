@@ -15,8 +15,10 @@ from sklearn.preprocessing import LabelEncoder
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import LocalEntryNotFoundError
 
+from .cache_plugin import TabICLKVCachePlugin
 from .preprocessing import TransformToNumerical, EnsembleGenerator
 from .sklearn_utils import validate_data
+from ..model.kv_cache import TabICLCache
 from tabicl import InferenceConfig
 from tabicl import TabICL
 
@@ -195,6 +197,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         device: Optional[str | torch.device] = None,
         random_state: int | None = 42,
         n_jobs: Optional[int] = None,
+        use_kv_cache: bool = False,
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
     ):
@@ -214,6 +217,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.device = device
         self.n_jobs = n_jobs
         self.random_state = random_state
+        self.use_kv_cache = use_kv_cache
         self.verbose = verbose
         self.inference_config = inference_config
 
@@ -411,6 +415,12 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
                 f"natively supported by the model. Consider enabling hierarchical classification."
             )
 
+        if self.use_kv_cache and self.n_classes_ > self.model_.max_classes:
+            raise ValueError(
+                f"KV caching is not supported when the number of classes ({self.n_classes_}) exceeds the max number "
+                f"of classes ({self.model_.max_classes}) natively supported by the model."
+            )
+
         if self.n_classes_ > self.model_.max_classes and self.verbose:
             print(
                 f"The number of classes ({self.n_classes_}) exceeds the max number of classes ({self.model_.max_classes}) "
@@ -432,7 +442,22 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         )
         self.ensemble_generator_.fit(X, y)
 
+        self.model_kv_cache_ = None
+        if self.use_kv_cache:
+            self._build_kv_cache()
+
         return self
+
+    def _get_kv_cache_plugin(self) -> TabICLKVCachePlugin:
+        return TabICLKVCachePlugin(
+            model=self.model_,
+            device=self.device_,
+            inference_config=self.inference_config_,
+            batch_size=self.batch_size,
+        )
+
+    def _build_kv_cache(self) -> None:
+        self.model_kv_cache_ = self._get_kv_cache_plugin().build_cache(self.ensemble_generator_)
 
     def _batch_forward(self, Xs, ys, shuffle_patterns=None):
         """Process model forward passes in batches to manage memory efficiently.
@@ -490,6 +515,14 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
 
         return np.concatenate(outputs, axis=0)
 
+    def _batch_forward_with_cache(self, Xs, kv_cache: TabICLCache):
+        return self._get_kv_cache_plugin().predict_view_with_cache(
+            Xs,
+            kv_cache,
+            average_logits=True if self.average_logits else False,
+            softmax_temperature=self.softmax_temperature,
+        )
+
     def predict_proba(self, X):
         """Predict class probabilities for test samples.
 
@@ -540,12 +573,22 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         X = validate_data(self, X, reset=False, dtype=None, skip_check_array=True)
         X = self.X_encoder_.transform(X)
 
-        data = self.ensemble_generator_.transform(X)
-        outputs = []
-        for norm_method, (Xs, ys) in data.items():
-            shuffle_patterns = self.ensemble_generator_.feature_shuffle_patterns_[norm_method]
-            outputs.append(self._batch_forward(Xs, ys, shuffle_patterns))
-        outputs = np.concatenate(outputs, axis=0)
+        has_kv_cache = hasattr(self, "model_kv_cache_") and self.model_kv_cache_ is not None
+        if has_kv_cache:
+            data = self.ensemble_generator_.transform(X, mode="test")
+            outputs = self._get_kv_cache_plugin().predict_with_cache(
+                data,
+                self.model_kv_cache_,
+                average_logits=True if self.average_logits else False,
+                softmax_temperature=self.softmax_temperature,
+            )
+        else:
+            data = self.ensemble_generator_.transform(X, mode="both")
+            outputs = []
+            for norm_method, (Xs, ys) in data.items():
+                shuffle_patterns = self.ensemble_generator_.feature_shuffle_patterns_[norm_method]
+                outputs.append(self._batch_forward(Xs, ys, shuffle_patterns))
+            outputs = np.concatenate(outputs, axis=0)
 
         # Extract class shift offsets from ensemble generator
         class_shift_offsets = []

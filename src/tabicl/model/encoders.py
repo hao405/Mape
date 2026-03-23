@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional
 from torch import nn, Tensor
 
+from .kv_cache import KVCache, KVCacheEntry
 from .layers import MultiheadAttentionBlock, InducedSelfAttentionBlock
 from .rope import RotaryEmbedding
 
@@ -79,6 +80,7 @@ class Encoder(nn.Module):
         src: Tensor,
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
+        train_size: Optional[int] = None,
     ) -> Tensor:
         """Process input through the stacked blocks.
 
@@ -108,7 +110,36 @@ class Encoder(nn.Module):
         """
         out = src
         for block in self.blocks:
-            out = block(q=out, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=self.rope)
+            out = block(
+                q=out,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                train_size=train_size,
+                rope=self.rope,
+            )
+
+        return out
+
+    def forward_with_cache(
+        self,
+        src: Tensor,
+        icl_cache: KVCache,
+        train_size: Optional[int] = None,
+        use_cache: bool = False,
+        store_cache: bool = True,
+    ) -> Tensor:
+        if use_cache == store_cache:
+            raise ValueError("Exactly one of use_cache or store_cache must be True")
+        if store_cache and train_size is None:
+            raise ValueError("train_size must be provided when store_cache=True")
+
+        out = src
+        for layer_idx, block in enumerate(self.blocks):
+            if use_cache:
+                out = block(q=out, rope=self.rope, cached_kv=icl_cache.kv[layer_idx])
+            else:
+                out, k_proj, v_proj = block(q=out, train_size=train_size, rope=self.rope, need_kv=True)
+                icl_cache.kv[layer_idx] = KVCacheEntry(key=k_proj, value=v_proj)
 
         return out
 
@@ -204,5 +235,24 @@ class SetTransformer(nn.Module):
         out = src
         for block in self.blocks:
             out = block(out, train_size)
+
+        return out
+
+    def forward_with_cache(
+        self,
+        src: Tensor,
+        col_cache: KVCache,
+        train_size: Optional[int] = None,
+        use_cache: bool = False,
+        store_cache: bool = True,
+    ) -> Tensor:
+        if use_cache == store_cache:
+            raise ValueError("Exactly one of use_cache or store_cache must be True")
+        if store_cache and train_size is None:
+            raise ValueError("train_size must be provided when store_cache=True")
+
+        out = src
+        for block_idx, block in enumerate(self.blocks):
+            out = block.forward_with_cache(out, col_cache, block_idx, train_size, use_cache, store_cache)
 
         return out
