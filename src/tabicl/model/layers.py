@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from .kv_cache import KVCache, KVCacheEntry
 from .rope import RotaryEmbedding
 from .attention import multi_head_attention_forward
+from .rwkv_time_mix import RWKV7TimeMixForTabICL
 
 
 class ClassNode:
@@ -356,16 +357,26 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
+        attention_impl: str = "original",
     ):
         super().__init__(d_model, nhead, dim_feedforward, dropout, activation, norm_first=norm_first, batch_first=True)
         del self.self_attn
-        self.attn = MultiheadAttention(d_model, nhead, dropout)
+        self.attention_impl = attention_impl
+        if attention_impl == "original":
+            self.attn = MultiheadAttention(d_model, nhead, dropout)
+            self.rwkv_time_mix = None
+        elif attention_impl == "rwkv7":
+            self.attn = None
+            self.rwkv_time_mix = RWKV7TimeMixForTabICL(d_model=d_model, nhead=nhead)
+        else:
+            raise ValueError(f"Unknown attention_impl: {attention_impl}. Supported: ['original', 'rwkv7']")
         self.init_weights()
 
     def init_weights(self):
         """Initialize projection layers to zero for stable training."""
-        nn.init.zeros_(self.attn.out_proj.weight)
-        nn.init.zeros_(self.attn.out_proj.bias)
+        if self.attn is not None:
+            nn.init.zeros_(self.attn.out_proj.weight)
+            nn.init.zeros_(self.attn.out_proj.bias)
         nn.init.zeros_(self.linear2.weight)
         nn.init.zeros_(self.linear2.bias)
 
@@ -418,6 +429,18 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         Tensor
             Output tensor of shape (..., tgt_len, d_model)
         """
+        if self.attention_impl == "rwkv7":
+            return self._forward_rwkv(
+                q=q,
+                k=k,
+                v=v,
+                cached_kv=cached_kv,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                train_size=train_size,
+                rope=rope,
+                need_kv=need_kv,
+            )
 
         if isinstance(attn_mask, int):
             assert key_padding_mask is None, "key_padding_mask is not supported with attn_mask as int"
@@ -509,6 +532,70 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
 
         return x
 
+    def _forward_rwkv(
+        self,
+        q: Tensor,
+        k: Optional[Tensor] = None,
+        v: Optional[Tensor] = None,
+        cached_kv: Optional[KVCacheEntry] = None,
+        key_padding_mask: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor | int] = None,
+        train_size: Optional[int] = None,
+        rope: Optional[RotaryEmbedding] = None,
+        need_kv: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
+        if k is not None or v is not None:
+            raise ValueError("RWKV7 attention_impl only supports self-attention replacement in the ICL encoder")
+        if rope is not None:
+            raise ValueError("RWKV7 attention_impl does not support rotary positional encoding")
+
+        mask = self._resolve_rwkv_mask(key_padding_mask=key_padding_mask, attn_mask=attn_mask, train_size=train_size)
+        x = q
+
+        if self.norm_first:
+            mix_result = self._rwkv_block(self.norm1(q), mask=mask, cached_kv=cached_kv, need_kv=need_kv)
+            if need_kv and isinstance(mix_result, tuple):
+                attn, k_proj, v_proj = mix_result
+            else:
+                attn = mix_result
+                k_proj = v_proj = None
+            x = x + attn
+            x = x + self._ff_block(self.norm2(x))
+        else:
+            mix_result = self._rwkv_block(q, mask=mask, cached_kv=cached_kv, need_kv=need_kv)
+            if need_kv and isinstance(mix_result, tuple):
+                attn, k_proj, v_proj = mix_result
+            else:
+                attn = mix_result
+                k_proj = v_proj = None
+            x = self.norm1(x + attn)
+            x = self.norm2(x + self._ff_block(x))
+
+        if need_kv and cached_kv is None and k_proj is not None and v_proj is not None:
+            return x, k_proj, v_proj
+
+        return x
+
+    @staticmethod
+    def _resolve_rwkv_mask(
+        key_padding_mask: Optional[Tensor],
+        attn_mask: Optional[Tensor | int],
+        train_size: Optional[int],
+    ) -> Optional[Tensor | int]:
+        if train_size is not None:
+            if attn_mask is not None or key_padding_mask is not None:
+                raise ValueError("RWKV7 attention_impl does not support combining train_size with other masks")
+            return train_size
+
+        if attn_mask is not None:
+            if not isinstance(attn_mask, int):
+                raise ValueError("RWKV7 attention_impl only supports int masks in the ICL path")
+            if key_padding_mask is not None:
+                raise ValueError("RWKV7 attention_impl does not support both attn_mask and key_padding_mask")
+            return attn_mask
+
+        return key_padding_mask
+
     def _attn_block(
         self,
         q: Tensor,
@@ -533,6 +620,19 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         if need_kv and isinstance(result, tuple):
             attn, k_proj, v_proj = result
             return self.dropout1(attn), k_proj, v_proj
+        return self.dropout1(result)
+
+    def _rwkv_block(
+        self,
+        q: Tensor,
+        mask: Optional[Tensor | int] = None,
+        cached_kv: Optional[KVCacheEntry] = None,
+        need_kv: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
+        result = self.rwkv_time_mix(q, mask=mask, cached_state=cached_kv, need_state=need_kv)
+        if need_kv and isinstance(result, tuple):
+            attn, cached_state, last_token = result
+            return self.dropout1(attn), cached_state, last_token
         return self.dropout1(result)
 
     def _ff_block(self, x: Tensor) -> Tensor:

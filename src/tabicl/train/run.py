@@ -182,6 +182,7 @@ class Trainer:
             "row_rope_base": self.config.row_rope_base,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
+            "attention_impl": self.config.attention_impl,
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,

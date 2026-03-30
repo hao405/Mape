@@ -6,6 +6,10 @@ REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 TRAIN_RUN="${REPO_ROOT}/src/tabicl/train/run.py"
 PRIOR_GENLOAD="${REPO_ROOT}/src/tabicl/prior/genload.py"
+OUTPUT_ROOT="${STAGE1_OUTPUT_ROOT:-${REPO_ROOT}/output/stage1}"
+CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-/data0/zhuhao2025/.conda/envs/tabicl}"
+PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV_PREFIX}/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV_PREFIX}/bin/torchrun}"
 
 require_env_dir() {
     var_name="$1"
@@ -16,32 +20,47 @@ require_env_dir() {
         printf '%s\n' "$description" >&2
         exit 1
     fi
+    if [ ! -d "$value" ]; then
+        printf '%s\n' "$description" >&2
+        exit 1
+    fi
 }
 
-WANDB_DIR="${WANDB_DIR:-}"
-STAGE1_CHECKPOINT_DIR="${STAGE1_CHECKPOINT_DIR:-}"
-STAGE1_PRIOR_DIR="${STAGE1_PRIOR_DIR:-}"
+WANDB_DIR="${WANDB_DIR:-${OUTPUT_ROOT}/wandb}"
+STAGE1_CHECKPOINT_DIR="${STAGE1_CHECKPOINT_DIR:-${OUTPUT_ROOT}/checkpoints}"
+STAGE1_PRIOR_DIR="${STAGE1_PRIOR_DIR:-${OUTPUT_ROOT}/prior}"
 
-require_env_dir WANDB_DIR "Please set WANDB_DIR to a writable directory."
-require_env_dir STAGE1_CHECKPOINT_DIR "Please set STAGE1_CHECKPOINT_DIR to a writable directory."
-require_env_dir STAGE1_PRIOR_DIR "Please set STAGE1_PRIOR_DIR to a writable directory."
+require_env_dir CONDA_ENV_PREFIX "Please set CONDA_ENV_PREFIX to an existing Python environment directory."
+if [ ! -x "$PYTHON_BIN" ]; then
+    printf '%s\n' "Python executable not found: $PYTHON_BIN" >&2
+    exit 1
+fi
+if [ ! -x "$TORCHRUN_BIN" ]; then
+    printf '%s\n' "torchrun executable not found: $TORCHRUN_BIN" >&2
+    exit 1
+fi
 
 mkdir -p "$WANDB_DIR" "$STAGE1_CHECKPOINT_DIR" "$STAGE1_PRIOR_DIR"
 
-# This script is used to train TabICL for the first stage of the curriculum learning
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+
+# This script is used to train TabICL for the first stage of the curriculum learning.
 
 # ----------------------------------
 # Generate prior datasets on the fly
 # ----------------------------------
 
-torchrun --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
+/bin/echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+/bin/echo "Writing outputs to ${OUTPUT_ROOT}"
+
+"${TORCHRUN_BIN}" --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
     --wandb_log True \
     --wandb_project TabICL \
     --wandb_name Stage1 \
     --wandb_dir "$WANDB_DIR" \
     --wandb_mode online \
     --device cuda \
-    --dtype float16 \
+    --dtype float32 \
     --np_seed 43 \
     --torch_seed 42 \
     --max_steps 160000 \
@@ -75,7 +94,7 @@ torchrun --standalone --nproc_per_node=1 "${TRAIN_RUN}" \
     --checkpoint_dir "$STAGE1_CHECKPOINT_DIR" \
     --save_temp_every 50 \
     --save_perm_every 5000 \
-    --only_load_model True \
+    --only_load_model True
 
 # # ------------------------------------------------------
 # # Save prior datasets to disk and load them for training

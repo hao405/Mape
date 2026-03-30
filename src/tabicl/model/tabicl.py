@@ -130,6 +130,10 @@ class TabICL(nn.Module):
     icl_nhead : int, default=4
         Number of attention heads in the in-context learning transformer
 
+    attention_impl : str, default="original"
+        Attention implementation used only in the dataset-wise ICL encoder.
+        Supported values are "original" and "rwkv7".
+
     ff_factor : int, default=2
         Expansion factor for feedforward networks across all components
 
@@ -160,6 +164,7 @@ class TabICL(nn.Module):
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
+        attention_impl: str = "original",
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -177,6 +182,7 @@ class TabICL(nn.Module):
         self.dropout = dropout
         self.activation = activation
         self.norm_first = norm_first
+        self.attention_impl = attention_impl
 
         self.col_embedder = ColEmbedding(
             embed_dim=embed_dim,
@@ -212,6 +218,7 @@ class TabICL(nn.Module):
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,
+            attention_impl=attention_impl,
         )
         self._cache: Optional[TabICLCache] = None
 

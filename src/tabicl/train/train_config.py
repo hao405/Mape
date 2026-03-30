@@ -191,6 +191,13 @@ def build_parser():
     # ICL Config
     parser.add_argument("--icl_num_blocks", type=int, default=12, help="Number of transformer blocks in ICL predictor")
     parser.add_argument("--icl_nhead", type=int, default=4, help="Number of attention heads in ICL predictor")
+    parser.add_argument(
+        "--attention_impl",
+        type=str,
+        default="original",
+        choices=["original", "rwkv7"],
+        help="Attention implementation for the dataset-wise ICL encoder",
+    )
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 
     # Shared Architecture Config
