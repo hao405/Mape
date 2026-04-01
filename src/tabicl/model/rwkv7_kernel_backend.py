@@ -11,12 +11,91 @@ from torch.utils.cpp_extension import load
 
 CHUNK_LEN = 16
 _MIN_CUDA_HEAD_SIZE = 4
+_TRITON_HEAD_SIZE = 64
+_VALID_BACKEND_OVERRIDES = {"auto", "cuda", "triton", "torch"}
 _CUDA_KERNELS: dict[int, Callable] = {}
 _CUDA_KERNEL_ERRORS: dict[int, str] = {}
+_TRITON_KERNELS: dict[int, Callable] = {}
+_TRITON_KERNEL_ERRORS: dict[int, str] = {}
+_TRITON_BACKEND_AVAILABLE: Optional[bool] = None
 
 
 def get_kernel_error(head_size: int) -> Optional[str]:
-    return _CUDA_KERNEL_ERRORS.get(head_size)
+    return _TRITON_KERNEL_ERRORS.get(head_size) or _CUDA_KERNEL_ERRORS.get(head_size)
+
+
+def _get_backend_override() -> str:
+    backend = os.getenv("TABICL_RWKV7_BACKEND", "auto").strip().lower() or "auto"
+    if backend not in _VALID_BACKEND_OVERRIDES:
+        warnings.warn(
+            f"Unknown TABICL_RWKV7_BACKEND={backend!r}; expected one of "
+            f"{sorted(_VALID_BACKEND_OVERRIDES)}. Falling back to auto.",
+            RuntimeWarning,
+        )
+        return "auto"
+    return backend
+
+
+def _is_rocm_device(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_available() and getattr(torch.version, "hip", None) is not None
+
+
+def _is_nvidia_cuda_device(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_available() and getattr(torch.version, "hip", None) is None
+
+
+def _can_attempt_cuda_backend(head_size: int, device: torch.device) -> bool:
+    return _is_nvidia_cuda_device(device) and head_size % _MIN_CUDA_HEAD_SIZE == 0
+
+
+def _can_attempt_triton_backend(head_size: int, device: torch.device) -> bool:
+    return (
+        device.type == "cuda"
+        and torch.cuda.is_available()
+        and head_size == _TRITON_HEAD_SIZE
+        and _has_triton_backend_support()
+    )
+
+
+def _has_triton_backend_support() -> bool:
+    global _TRITON_BACKEND_AVAILABLE
+    if _TRITON_BACKEND_AVAILABLE is not None:
+        return _TRITON_BACKEND_AVAILABLE
+
+    try:
+        from .rwkv7_triton_backend import build_triton_backend
+    except Exception:
+        _TRITON_BACKEND_AVAILABLE = False
+        return False
+
+    _TRITON_BACKEND_AVAILABLE = build_triton_backend() is not None
+    return _TRITON_BACKEND_AVAILABLE
+
+
+def _select_backend(
+    *,
+    head_size: int,
+    device: torch.device,
+    prefer_kernel: bool,
+) -> str:
+    if not prefer_kernel:
+        return "torch"
+
+    requested = _get_backend_override()
+    if requested == "torch":
+        return "torch"
+    if requested == "cuda":
+        return "cuda" if _can_attempt_cuda_backend(head_size=head_size, device=device) else "torch"
+    if requested == "triton":
+        return "triton" if _can_attempt_triton_backend(head_size=head_size, device=device) else "torch"
+
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return "torch"
+    if _is_rocm_device(device):
+        return "triton" if _can_attempt_triton_backend(head_size=head_size, device=device) else "torch"
+    if _is_nvidia_cuda_device(device):
+        return "cuda" if _can_attempt_cuda_backend(head_size=head_size, device=device) else "torch"
+    return "torch"
 
 
 def generalized_delta_rule(
@@ -45,56 +124,18 @@ def generalized_delta_rule(
         head_first=head_first,
     )
 
-    backend = "torch"
-    kernel = None
-    if prefer_kernel:
-        kernel = _get_cuda_kernel(head_size=r.shape[-1], device=r.device)
-
-    if kernel is not None:
-        try:
-            out, final_state = _run_cuda_kernel(
-                kernel=kernel,
-                r=r,
-                w=w,
-                k=k,
-                v=v,
-                a=a,
-                b=b,
-                initial_state=initial_state,
-                mask=mask,
-            )
-            backend = "cuda"
-        except Exception as exc:  # pragma: no cover - exercised only when kernel runtime fails
-            _CUDA_KERNELS.pop(r.shape[-1], None)
-            _CUDA_KERNEL_ERRORS[r.shape[-1]] = str(exc)
-            warnings.warn(
-                f"RWKV7 CUDA kernel runtime failed for head_size={r.shape[-1]}; falling back to PyTorch. "
-                f"Reason: {exc}",
-                RuntimeWarning,
-            )
-            out, final_state = generalized_delta_rule_torch(
-                r=r,
-                w=w,
-                k=k,
-                v=v,
-                a=a,
-                b=b,
-                initial_state=initial_state,
-                output_final_state=True,
-                mask=mask,
-            )
-    else:
-        out, final_state = generalized_delta_rule_torch(
-            r=r,
-            w=w,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            initial_state=initial_state,
-            output_final_state=True,
-            mask=mask,
-        )
+    backend = _select_backend(head_size=r.shape[-1], device=r.device, prefer_kernel=prefer_kernel)
+    out, final_state, backend = _run_selected_backend(
+        backend=backend,
+        r=r,
+        w=w,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        initial_state=initial_state,
+        mask=mask,
+    )
 
     if head_first:
         out = out.transpose(1, 2)
@@ -197,8 +238,133 @@ def _canonicalize_inputs(
     return r, w, k, v, a, b, initial_state, mask
 
 
+def _run_selected_backend(
+    *,
+    backend: str,
+    r: Tensor,
+    w: Tensor,
+    k: Tensor,
+    v: Tensor,
+    a: Tensor,
+    b: Tensor,
+    initial_state: Optional[Tensor],
+    mask: Optional[Tensor],
+) -> tuple[Tensor, Tensor, str]:
+    head_size = r.shape[-1]
+
+    if backend == "cuda":
+        kernel = _get_cuda_kernel(head_size=head_size, device=r.device)
+        if kernel is not None:
+            try:
+                out, final_state = _run_cuda_kernel(
+                    kernel=kernel,
+                    r=r,
+                    w=w,
+                    k=k,
+                    v=v,
+                    a=a,
+                    b=b,
+                    initial_state=initial_state,
+                    mask=mask,
+                )
+                return out, final_state, "cuda"
+            except Exception as exc:  # pragma: no cover - depends on host CUDA runtime
+                _CUDA_KERNELS.pop(head_size, None)
+                _CUDA_KERNEL_ERRORS[head_size] = str(exc)
+                warnings.warn(
+                    f"RWKV7 CUDA kernel runtime failed for head_size={head_size}; falling back to PyTorch. "
+                    f"Reason: {exc}",
+                    RuntimeWarning,
+                )
+
+    if backend == "triton":
+        kernel = _get_triton_kernel(head_size=head_size, device=r.device)
+        if kernel is not None:
+            try:
+                out, final_state = _run_triton_kernel(
+                    kernel=kernel,
+                    r=r,
+                    w=w,
+                    k=k,
+                    v=v,
+                    a=a,
+                    b=b,
+                    initial_state=initial_state,
+                    mask=mask,
+                )
+                return out, final_state, "triton"
+            except Exception as exc:  # pragma: no cover - depends on local Triton runtime
+                _TRITON_KERNELS.pop(head_size, None)
+                _TRITON_KERNEL_ERRORS[head_size] = str(exc)
+                warnings.warn(
+                    f"RWKV7 Triton kernel runtime failed for head_size={head_size}; falling back to PyTorch. "
+                    f"Reason: {exc}",
+                    RuntimeWarning,
+                )
+
+    out, final_state = generalized_delta_rule_torch(
+        r=r,
+        w=w,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        initial_state=initial_state,
+        output_final_state=True,
+        mask=mask,
+    )
+    return out, final_state, "torch"
+
+
+def _get_triton_kernel(head_size: int, device: torch.device) -> Optional[Callable]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    if head_size != _TRITON_HEAD_SIZE:
+        _TRITON_KERNEL_ERRORS.setdefault(
+            head_size,
+            f"head_size must equal {_TRITON_HEAD_SIZE} for the Triton backend",
+        )
+        return None
+    if head_size in _TRITON_KERNELS:
+        return _TRITON_KERNELS[head_size]
+    if head_size in _TRITON_KERNEL_ERRORS:
+        return None
+
+    try:
+        from .rwkv7_triton_backend import build_triton_backend, get_triton_import_error
+    except Exception as exc:  # pragma: no cover - import path depends on host Triton install
+        _TRITON_KERNEL_ERRORS[head_size] = str(exc)
+        warnings.warn(
+            f"RWKV7 Triton backend could not be imported for head_size={head_size}; falling back to PyTorch. "
+            f"Reason: {exc}",
+            RuntimeWarning,
+        )
+        return None
+
+    kernel = build_triton_backend()
+    if kernel is None:
+        error = get_triton_import_error() or "Triton is unavailable on this host"
+        _TRITON_KERNEL_ERRORS[head_size] = error
+        warnings.warn(
+            f"RWKV7 Triton backend is unavailable for head_size={head_size}; falling back to PyTorch. "
+            f"Reason: {error}",
+            RuntimeWarning,
+        )
+        return None
+
+    _TRITON_KERNELS[head_size] = kernel
+    return kernel
+
+
 def _get_cuda_kernel(head_size: int, device: torch.device) -> Optional[Callable]:
     if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    # ROCm exposes CUDA-style devices in PyTorch, but this extension is NVCC/CUDA specific.
+    if _is_rocm_device(device):
+        _CUDA_KERNEL_ERRORS.setdefault(
+            head_size,
+            "ROCm devices skip the CUDA extension backend and should use Triton or PyTorch instead",
+        )
         return None
     if head_size % _MIN_CUDA_HEAD_SIZE != 0:
         _CUDA_KERNEL_ERRORS.setdefault(
@@ -444,6 +610,31 @@ def _build_cuda_kernel(namespace: str) -> Callable:
 
 
 def _run_cuda_kernel(
+    kernel: Callable,
+    r: Tensor,
+    w: Tensor,
+    k: Tensor,
+    v: Tensor,
+    a: Tensor,
+    b: Tensor,
+    initial_state: Optional[Tensor],
+    mask: Optional[Tensor],
+) -> tuple[Tensor, Tensor]:
+    padded = _pad_inputs_for_chunk_alignment(r=r, w=w, k=k, v=v, a=a, b=b, mask=mask)
+    out, state = kernel(
+        r=padded["r"],
+        w=padded["w"],
+        k=padded["k"],
+        v=padded["v"],
+        a=padded["a"],
+        b=padded["b"],
+        initial_state=initial_state,
+        mask=padded["mask"],
+    )
+    return out[:, : r.size(1)].contiguous(), state
+
+
+def _run_triton_kernel(
     kernel: Callable,
     r: Tensor,
     w: Tensor,
