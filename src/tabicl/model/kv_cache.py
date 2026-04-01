@@ -73,10 +73,11 @@ class KVCache:
         return KVCache(kv=merged)
 
     def preallocate(self, reference: KVCache, batch_shape: tuple, device="cpu"):
+        batch_ndim = len(batch_shape)
         for idx, ref_entry in reference.kv.items():
             if ref_entry.is_valid():
-                key_shape = batch_shape + ref_entry.key.shape[-3:]
-                value_shape = batch_shape + ref_entry.value.shape[-3:]
+                key_shape = batch_shape + ref_entry.key.shape[batch_ndim:]
+                value_shape = batch_shape + ref_entry.value.shape[batch_ndim:]
                 self.kv[idx] = KVCacheEntry(
                     key=torch.zeros(key_shape, dtype=ref_entry.key.dtype, device=device),
                     value=torch.zeros(value_shape, dtype=ref_entry.value.dtype, device=device),

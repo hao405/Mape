@@ -7,19 +7,18 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .kv_cache import KVCacheEntry
+from .rwkv7_kernel_backend import generalized_delta_rule
 
 
 class RWKV7TimeMixForTabICL(nn.Module):
-    """Minimal RWKV-7 style TimeMix adapted to TabICL's [B, N, D] tensors.
+    """RWKV7-style time mix for TabICL's [B, T, D] ICL encoder path.
 
-    This module intentionally keeps only the time-mixing ideas needed for a first
-    integration pass:
-    - previous-token shift with learned channel-wise mixing
-    - recurrent per-channel state update
-    - a support/query mode compatible with TabICL's train_size masking
+    The cached state stores:
+    - `key`: the per-head delta-rule state [B, H, K, K]
+    - `value`: the last support token [B, D]
 
-    It is shape-compatible with the original attention path, but not semantically
-    equivalent to the original support/query attention.
+    Query tokens reuse the cached state but are evaluated with an all-zero update mask,
+    so they can read support context without mutating the cache.
     """
 
     def __init__(self, d_model: int, nhead: int) -> None:
@@ -29,6 +28,8 @@ class RWKV7TimeMixForTabICL(nn.Module):
 
         self.d_model = d_model
         self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.last_backend = "torch"
 
         ddd = torch.linspace(0.0, 1.0, d_model).view(1, 1, d_model)
         self.x_r = nn.Parameter(1.0 - torch.pow(ddd, 0.20))
@@ -36,13 +37,15 @@ class RWKV7TimeMixForTabICL(nn.Module):
         self.x_k = nn.Parameter(1.0 - torch.pow(ddd, 0.70))
         self.x_v = nn.Parameter(1.0 - torch.pow(ddd, 0.70))
         self.x_a = nn.Parameter(1.0 - torch.pow(ddd, 0.90))
+        self.x_b = nn.Parameter(1.0 - torch.pow(ddd, 0.90))
         self.x_g = nn.Parameter(1.0 - torch.pow(ddd, 0.20))
 
         self.receptance = nn.Linear(d_model, d_model, bias=False)
         self.time_decay = nn.Linear(d_model, d_model, bias=False)
         self.key = nn.Linear(d_model, d_model, bias=False)
         self.value = nn.Linear(d_model, d_model, bias=False)
-        self.in_context = nn.Linear(d_model, d_model, bias=False)
+        self.time_a = nn.Linear(d_model, d_model, bias=False)
+        self.time_b = nn.Linear(d_model, d_model, bias=False)
         self.gate = nn.Linear(d_model, d_model, bias=False)
         self.output = nn.Linear(d_model, d_model)
         self.ln_x = nn.GroupNorm(nhead, d_model, eps=64e-5)
@@ -55,7 +58,8 @@ class RWKV7TimeMixForTabICL(nn.Module):
             self.time_decay,
             self.key,
             self.value,
-            self.in_context,
+            self.time_a,
+            self.time_b,
             self.gate,
         ):
             nn.init.xavier_uniform_(layer.weight)
@@ -71,7 +75,7 @@ class RWKV7TimeMixForTabICL(nn.Module):
         need_state: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
         if x.dim() != 3:
-            raise ValueError(f"RWKV7TimeMixForTabICL expects [B, N, D], but got {tuple(x.shape)}")
+            raise ValueError(f"RWKV7TimeMixForTabICL expects [B, T, D], but got {tuple(x.shape)}")
         if x.size(-1) != self.d_model:
             raise ValueError(f"Last dim {x.size(-1)} does not match d_model {self.d_model}")
 
@@ -100,12 +104,13 @@ class RWKV7TimeMixForTabICL(nn.Module):
         if not cached_state.is_valid():
             raise ValueError("RWKV7TimeMixForTabICL requires a populated cached_state")
 
-        support_state = cached_state.key.to(device=x.device, dtype=x.dtype)
+        support_state = cached_state.key.to(device=x.device, dtype=torch.float32)
         last_token = cached_state.value.to(device=x.device, dtype=x.dtype)
-        expected = (x.size(0), self.d_model)
-        if support_state.shape != expected or last_token.shape != expected:
+        expected_state = (x.size(0), self.nhead, self.head_dim, self.head_dim)
+        expected_token = (x.size(0), self.d_model)
+        if support_state.shape != expected_state or last_token.shape != expected_token:
             raise ValueError(
-                f"Expected cached state tensors of shape {expected}, got "
+                f"Expected cached state shapes {expected_state} and {expected_token}, got "
                 f"{tuple(support_state.shape)} and {tuple(last_token.shape)}"
             )
         return support_state, last_token
@@ -122,7 +127,11 @@ class RWKV7TimeMixForTabICL(nn.Module):
 
         return prev - x
 
-    def _project(self, x: Tensor, prev_token: Optional[Tensor] = None) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def _project(
+        self,
+        x: Tensor,
+        prev_token: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         xx = self._shift_delta(x, prev_token=prev_token)
 
         xr = x + xx * self.x_r
@@ -130,23 +139,83 @@ class RWKV7TimeMixForTabICL(nn.Module):
         xk = x + xx * self.x_k
         xv = x + xx * self.x_v
         xa = x + xx * self.x_a
+        xb = x + xx * self.x_b
         xg = x + xx * self.x_g
 
-        r = torch.sigmoid(self.receptance(xr))
-        decay = torch.exp(-F.softplus(self.time_decay(xw)))
-        k = torch.tanh(self.key(xk))
-        v = self.value(xv)
-        alpha = torch.sigmoid(self.in_context(xa))
+        r = self._reshape_heads(self.receptance(xr))
+        w = self._reshape_heads(-F.softplus(self.time_decay(xw)))
+        k = self._reshape_heads(torch.tanh(self.key(xk)))
+        v = self._reshape_heads(self.value(xv))
+        a = F.normalize(self._reshape_heads(self.time_a(xa)), dim=-1, eps=1e-6)
+        b = F.normalize(self._reshape_heads(self.time_b(xb)), dim=-1, eps=1e-6)
         g = torch.sigmoid(self.gate(xg))
-        return r, decay, k, v, alpha, g
+        return r, w, k, v, a, b, g
+
+    def _reshape_heads(self, tensor: Tensor) -> Tensor:
+        batch_size, seq_len, _ = tensor.shape
+        return tensor.view(batch_size, seq_len, self.nhead, self.head_dim)
+
+    def _mask_projections(
+        self,
+        r: Tensor,
+        w: Tensor,
+        k: Tensor,
+        v: Tensor,
+        a: Tensor,
+        b: Tensor,
+        g: Tensor,
+        valid_tokens: Optional[Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        if valid_tokens is None:
+            return r, w, k, v, a, b, g
+
+        token_mask = valid_tokens.unsqueeze(-1).unsqueeze(-1).to(r.dtype)
+        gate_mask = valid_tokens.unsqueeze(-1).to(g.dtype)
+        return (
+            r * token_mask,
+            w,
+            k * token_mask,
+            v * token_mask,
+            a * token_mask,
+            b * token_mask,
+            g * gate_mask,
+        )
+
+    def _run_delta_rule(
+        self,
+        r: Tensor,
+        w: Tensor,
+        k: Tensor,
+        v: Tensor,
+        a: Tensor,
+        b: Tensor,
+        initial_state: Optional[Tensor] = None,
+        update_mask: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor]:
+        mixed, state, backend = generalized_delta_rule(
+            r=r,
+            w=w,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state=initial_state,
+            output_final_state=True,
+            mask=update_mask,
+            prefer_kernel=True,
+            return_backend=True,
+        )
+        self.last_backend = backend
+        return mixed, state
 
     def _finalize(self, mixed: Tensor, gate: Tensor) -> Tensor:
         if mixed.numel() == 0:
-            return mixed
+            return mixed.reshape(mixed.size(0), mixed.size(1), self.d_model)
 
-        bsz, seq_len, _ = mixed.shape
-        mixed = self.ln_x(mixed.reshape(bsz * seq_len, self.d_model)).view(bsz, seq_len, self.d_model)
-        return self.output(mixed * gate)
+        bsz, seq_len, _, _ = mixed.shape
+        merged = mixed.reshape(bsz, seq_len, self.d_model)
+        merged = self.ln_x(merged.reshape(bsz * seq_len, self.d_model)).view(bsz, seq_len, self.d_model)
+        return self.output(merged * gate)
 
     def _scan_sequence(
         self,
@@ -154,29 +223,23 @@ class RWKV7TimeMixForTabICL(nn.Module):
         padding_mask: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         bsz, seq_len, _ = x.shape
-        state = x.new_zeros(bsz, self.d_model)
-        outputs = []
+        if seq_len == 0:
+            empty_state = torch.zeros(bsz, self.nhead, self.head_dim, self.head_dim, dtype=torch.float32, device=x.device)
+            empty_token = x.new_zeros(bsz, self.d_model)
+            return x, empty_state, empty_token
 
-        r, decay, k, v, alpha, g = self._project(x)
         valid_tokens = None if padding_mask is None else ~padding_mask
+        r, w, k, v, a, b, g = self._project(x)
+        r, w, k, v, a, b, g = self._mask_projections(r, w, k, v, a, b, g, valid_tokens)
+        update_mask = None if valid_tokens is None else valid_tokens.to(dtype=torch.float32, device=x.device)
 
-        for idx in range(seq_len):
-            updated_state = state * decay[:, idx, :] + alpha[:, idx, :] * k[:, idx, :] * v[:, idx, :]
-            if valid_tokens is None:
-                state = updated_state
-                outputs.append(r[:, idx, :] * state)
-            else:
-                valid = valid_tokens[:, idx].unsqueeze(-1)
-                state = torch.where(valid, updated_state, state)
-                outputs.append(torch.where(valid, r[:, idx, :] * state, torch.zeros_like(state)))
-
-        mixed = x.new_empty(bsz, 0, self.d_model) if seq_len == 0 else torch.stack(outputs, dim=1)
+        mixed, final_state = self._run_delta_rule(r, w, k, v, a, b, update_mask=update_mask)
         out = self._finalize(mixed, g)
-        if padding_mask is not None and seq_len > 0:
+        if padding_mask is not None:
             out = out.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
-        last_token = x.new_zeros(bsz, self.d_model) if seq_len == 0 else x[:, seq_len - 1, :]
-        return out, state, last_token
+        last_token = self._gather_last_valid_token(x, valid_tokens)
+        return out, final_state, last_token
 
     def _forward_query_only(
         self,
@@ -185,12 +248,17 @@ class RWKV7TimeMixForTabICL(nn.Module):
         last_support_token: Tensor,
         padding_mask: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        _, seq_len, _ = x.shape
+        bsz, seq_len, _ = x.shape
         if seq_len == 0:
             return x, support_state, last_support_token
 
-        r, decay, _, _, _, g = self._project(x, prev_token=last_support_token)
-        mixed = r * (decay * support_state.unsqueeze(1))
+        valid_tokens = None if padding_mask is None else ~padding_mask
+        r, w, k, v, a, b, g = self._project(x, prev_token=last_support_token)
+        r, w, k, v, a, b, g = self._mask_projections(r, w, k, v, a, b, g, valid_tokens)
+
+        # Query tokens should read the support state without updating it.
+        freeze_mask = torch.zeros(bsz, seq_len, dtype=torch.float32, device=x.device)
+        mixed, _ = self._run_delta_rule(r, w, k, v, a, b, initial_state=support_state, update_mask=freeze_mask)
         out = self._finalize(mixed, g)
         if padding_mask is not None:
             out = out.masked_fill(padding_mask.unsqueeze(-1), 0.0)
@@ -207,7 +275,14 @@ class RWKV7TimeMixForTabICL(nn.Module):
             support_out, support_state, last_support_token = self._scan_sequence(support)
         else:
             support_out = x.new_empty(bsz, 0, self.d_model)
-            support_state = x.new_zeros(bsz, self.d_model)
+            support_state = torch.zeros(
+                bsz,
+                self.nhead,
+                self.head_dim,
+                self.head_dim,
+                dtype=torch.float32,
+                device=x.device,
+            )
             last_support_token = x.new_zeros(bsz, self.d_model)
 
         if query.size(1) == 0:
@@ -215,3 +290,15 @@ class RWKV7TimeMixForTabICL(nn.Module):
 
         query_out, _, _ = self._forward_query_only(query, support_state, last_support_token)
         return torch.cat([support_out, query_out], dim=1), support_state, last_support_token
+
+    def _gather_last_valid_token(self, x: Tensor, valid_tokens: Optional[Tensor]) -> Tensor:
+        if x.size(1) == 0:
+            return x.new_zeros(x.size(0), self.d_model)
+        if valid_tokens is None:
+            return x[:, -1, :]
+
+        has_valid = valid_tokens.any(dim=1)
+        reversed_mask = valid_tokens.flip(1).to(torch.int64)
+        last_idx = x.size(1) - 1 - reversed_mask.argmax(dim=1)
+        gathered = x[torch.arange(x.size(0), device=x.device), last_idx]
+        return torch.where(has_valid.unsqueeze(-1), gathered, torch.zeros_like(gathered))
